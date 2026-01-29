@@ -7,7 +7,7 @@
 - Run a command under an egress limit.
 - List or clear active leashes.
 
-## What it does NOT do (v1)
+## What it doesn't
 - No ingress throttling.
 - No daemon or background service.
 - No Kubernetes abstractions.
@@ -15,14 +15,13 @@
 - No persistence across reboot.
 - No process-tree manipulation beyond cgroup inheritance.
 
-## Why no ingress in v1
+## Why no ingress
 Ingress shaping is not reliably enforceable per-process with tc + cgroup on the receiving host. It requires IFB, ingress redirection, or external network control, and behavior is especially complex for UDP. This tool intentionally restricts scope to safe, deterministic egress control.
 
 ## How it works
 - Determines the target process’s **current cgroup v2 path** and creates a **child cgroup** under it.
 - Moves the target process into the child cgroup (threads move together).
 - Reads `cgroup.id` and installs a `tc` filter that maps that cgroup ID to a rate-limited class.
-
 This preserves all existing CPU/memory/IO limits and container/systemd placement.
 
 ### Cgroup inheritance behavior
