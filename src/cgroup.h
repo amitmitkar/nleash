@@ -9,6 +9,7 @@ struct CgroupInfo {
 };
 
 bool check_cgroup_v2(std::string &err);
+bool check_cgroup_id_support(std::string &err);
 bool ensure_cgroup_dir(const std::string &path, std::string &err);
 bool move_pid_to_cgroup(int pid, const std::string &path, std::string &err);
 bool read_cgroup_id(const std::string &path, std::string &out, std::string &err);

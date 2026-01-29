@@ -4,10 +4,12 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -111,7 +113,23 @@ bool ensure_cls_cgroup(std::string &err) {
     run_cmd_lit({"modprobe", "cls_cgroup"}, dummy); // best effort
     struct stat st;
     if (stat("/sys/module/cls_cgroup", &st) != 0) {
-        err = "cls_cgroup kernel module not loaded and not available";
+        // Module might be built-in. Check kernel config if available.
+        struct utsname uts;
+        if (uname(&uts) == 0) {
+            std::string cfg = std::string("/boot/config-") + uts.release;
+            std::ifstream in(cfg);
+            if (in) {
+                std::string line;
+                while (std::getline(in, line)) {
+                    if (line.rfind("CONFIG_NET_CLS_CGROUP=", 0) == 0) {
+                        if (line == "CONFIG_NET_CLS_CGROUP=y") return true;
+                        err = "cls_cgroup not available (CONFIG_NET_CLS_CGROUP is not enabled)";
+                        return false;
+                    }
+                }
+            }
+        }
+        err = "cls_cgroup kernel module not loaded and not available (module missing or built-in config unknown)";
         return false;
     }
     return true;

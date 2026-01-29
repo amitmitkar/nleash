@@ -283,6 +283,10 @@ static int do_apply_existing(const CliOptions &opt) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
+    if (!check_cgroup_id_support(err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
     if (!ensure_state_dir(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
@@ -371,6 +375,10 @@ static int do_run_command(const CliOptions &opt) {
         return 1;
     }
     if (!check_cgroup_v2(err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+    if (!check_cgroup_id_support(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }

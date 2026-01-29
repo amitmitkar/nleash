@@ -22,6 +22,16 @@ bool check_cgroup_v2(std::string &err) {
     return true;
 }
 
+bool check_cgroup_id_support(std::string &err) {
+    std::string path = cgroup_root() + "/cgroup.id";
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        err = "cgroup.id not available; kernel must support cgroup.id (often CONFIG_CGROUP_BPF)";
+        return false;
+    }
+    return true;
+}
+
 bool ensure_cgroup_dir(const std::string &path, std::string &err) {
     if (mkdir(path.c_str(), 0755) != 0) {
         if (errno == EEXIST) {

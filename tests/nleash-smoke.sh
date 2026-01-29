@@ -52,6 +52,10 @@ if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
   say "SKIP: cgroup v2 not detected at /sys/fs/cgroup."
   exit 0
 fi
+if [ ! -f /sys/fs/cgroup/cgroup.id ]; then
+  say "SKIP: cgroup.id not available (kernel missing cgroup.id support)."
+  exit 0
+fi
 
 say "Running nleash list tests..."
 "$BIN" --list >/dev/null
