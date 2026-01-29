@@ -24,7 +24,19 @@ $(HELPER): $(SRC) src/helper_main.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) -o $(HELPER) src/helper_main.cpp $(SRC) $(LDFLAGS)
 
+test: all
+	./tests/nleash-smoke.sh
+
+test-active: all
+	NLEASH_ACTIVE=1 ./tests/nleash-smoke.sh
+
+test-net: all
+	NLEASH_NETTEST=1 ./tests/nleash-smoke.sh
+
+test-all: all
+	NLEASH_ACTIVE=1 NLEASH_NETTEST=1 ./tests/nleash-smoke.sh
+
 clean:
 	rm -f $(BIN) $(HELPER)
 
-.PHONY: all clean
+.PHONY: all clean test test-active test-net test-all
