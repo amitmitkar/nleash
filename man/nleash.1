@@ -1,0 +1,57 @@
+.TH NLEASH 1 "January 2026" "nleash" "User Commands"
+.SH NAME
+nleash \- limit outbound bandwidth for a process using cgroup v2 and tc
+.SH SYNOPSIS
+.B nleash
+--pid PID --rate RATE [--iface IFACE]
+
+.B nleash
+--rate RATE [--iface IFACE] -- command [args...]
+
+.B nleash
+--pid PID --clear
+
+.B nleash
+--list [--json]
+.SH DESCRIPTION
+nleash applies egress bandwidth limits to a process using cgroup v2 and tc (HTB + cls_cgroup).
+It creates a child cgroup under the target's existing cgroup and classifies traffic by cgroup.id.
+
+Ingress shaping is intentionally not supported in v1.
+.PP
+For non-root usage, nleash can exec a setuid-root helper (nleash-helper) that performs
+the privileged operations. The helper enforces that non-root callers can only
+act on their own processes and drops privileges before executing commands.
+.SH OPTIONS
+.TP
+.BR --pid " " PID
+Target an existing process ID.
+.TP
+.BR --rate " " RATE
+Bandwidth rate string accepted by tc (e.g., 500kbit, 10mbit, 1gbit).
+.TP
+.BR --iface " " IFACE
+Network interface to shape. If omitted, the default route interface is detected via ip route.
+.TP
+.B --clear
+Clear the leash for the given PID (with safety identity checks).
+.TP
+.B --list
+List current leashes (from /run/nleash/state.txt). Output includes UID.
+.TP
+.B --json
+Output machine-readable JSON for --list.
+.SH REQUIREMENTS
+- Linux with cgroup v2 mounted at /sys/fs/cgroup
+- Kernel support for cls_cgroup and cgroup.id
+- CAP_NET_ADMIN and cgroup write permissions (run as root)
+- Userspace tools: tc, ip, modprobe
+.SH SAFETY
+Leashes are keyed by (pid, starttime_ticks, boot_id). If the identity does not match during
+--clear, nleash does not touch any live process and only removes stale tc/cgroup state.
+.SH FILES
+/run/nleash/state.txt
+/run/nleash/nextid
+.SH SEE ALSO
+.BR tc (8),
+.BR ip (8)
