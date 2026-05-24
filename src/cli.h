@@ -6,6 +6,7 @@
 struct CliOptions {
     bool list = false;
     bool clear = false;
+    bool stats = false;
     bool json = false;
     bool has_pid = false;
     int pid = -1;

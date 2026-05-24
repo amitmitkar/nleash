@@ -26,6 +26,10 @@ int nleash_run(int argc, char **argv, bool enforce_owner) {
         return manager.clear_leash(opt.pid);
     }
 
+    if (opt.stats) {
+        return manager.show_stats(opt.pid, opt.json);
+    }
+
     if (!opt.cmd.empty()) {
         if (opt.rate.empty()) {
             std::cerr << "nleash: --rate is required\n";

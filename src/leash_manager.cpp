@@ -234,6 +234,57 @@ int LeashManager::clear_leash(int pid) {
     return 0;
 }
 
+int LeashManager::show_stats(int pid, bool json) {
+    std::vector<LeashState> all;
+    std::string err;
+    if (!load_state(all, err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+
+    bool found_any = false;
+    if (json) std::cout << "[";
+    
+    for (const auto &st : all) {
+        if (pid > 0 && st.pid != pid) continue;
+        if (m_enforce_owner && m_real_uid != 0 && st.uid != static_cast<int>(m_real_uid)) continue;
+
+        TcStats stats;
+        if (!tc_get_stats(st.iface, st.leash_id, stats, err)) {
+            // Stats might fail if tc class is gone but state exists
+            continue;
+        }
+
+        if (json) {
+            if (found_any) std::cout << ",";
+            std::cout << "{"
+                      << "\"pid\":" << st.pid << ","
+                      << "\"bytes\":" << stats.bytes << ","
+                      << "\"packets\":" << stats.packets << ","
+                      << "\"dropped\":" << stats.drops << ","
+                      << "\"overlimits\":" << stats.overlimits << ","
+                      << "\"bps\":" << stats.bps << ","
+                      << "\"pps\":" << stats.pps
+                      << "}";
+        } else {
+            std::cout << "PID: " << st.pid << " | IFACE: " << st.iface << " | RATE: " << st.rate << "\n"
+                      << "  Sent: " << stats.bytes << " bytes, " << stats.packets << " packets\n"
+                      << "  Dropped: " << stats.drops << ", Overlimits: " << stats.overlimits << "\n"
+                      << "  Current Rate: " << stats.bps << " bps, " << stats.pps << " pps\n";
+        }
+        found_any = true;
+    }
+
+    if (json) std::cout << "]\n";
+    else if (!found_any) {
+        if (pid > 0) std::cerr << "nleash: no active leash for pid " << pid << "\n";
+        else std::cout << "No active leashes.\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 int LeashManager::apply_leash(int pid, const std::string& rate, const std::string& iface_opt) {
     std::string err;
     if (!check_tools(err)) {
@@ -411,8 +462,6 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
     std::string cgid;
     if (!read_cgroup_id(child, cgid, err)) {
         std::cerr << "nleash: " << err << "\n";
-        kill(pid, SIGTERM);
-        waitpid(pid, nullptr, 0);
         remove_cgroup_dir(child, err);
         return 1;
     }

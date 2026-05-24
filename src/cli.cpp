@@ -39,6 +39,10 @@ bool parse_cli(int argc, char **argv, CliOptions &out, std::string &err) {
             out.clear = true;
             continue;
         }
+        if (!end_of_flags && is_flag(arg, "--stats")) {
+            out.stats = true;
+            continue;
+        }
         if (!end_of_flags && is_flag(arg, "--list")) {
             out.list = true;
             continue;

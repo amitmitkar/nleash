@@ -171,13 +171,28 @@ static bool check_bpf_support(std::string &err) {
 }
 
 TcFilterMethod detect_tc_filter_method(std::string &err) {
-    // Try cls_cgroup first (for backwards compatibility with older kernels)
+    // Check kernel version
+    struct utsname uts;
+    if (uname(&uts) == 0) {
+        int major = 0, minor = 0;
+        if (sscanf(uts.release, "%d.%d", &major, &minor) == 2) {
+            if (major >= 6) {
+                // On kernel 6.0+, prefer eBPF
+                std::string bpf_err;
+                if (check_bpf_support(bpf_err)) {
+                    return TcFilterMethod::BPF;
+                }
+            }
+        }
+    }
+
+    // Try cls_cgroup (for backwards compatibility with older kernels)
     std::string cls_err;
     if (ensure_cls_cgroup(cls_err)) {
         return TcFilterMethod::CLS_CGROUP;
     }
 
-    // cls_cgroup not available, try eBPF
+    // cls_cgroup not available, try eBPF as last resort
     std::string bpf_err;
     if (check_bpf_support(bpf_err)) {
         return TcFilterMethod::BPF;
@@ -320,19 +335,25 @@ bool tc_setup_root(const std::string &iface, std::string &err) {
     // Check if a root qdisc already exists
     std::string out;
     if (run_cmd_capture({"tc", "qdisc", "show", "dev", iface, "root"}, out, err)) {
-        if (out.find("htb") != std::string::npos && out.find("handle 1:") != std::string::npos) {
+        if (out.find("htb") != std::string::npos && (out.find("handle 1:") != std::string::npos || out.find("1:") != std::string::npos)) {
             return true; // Already setup correctly
         }
-        if (out.find("qdisc") != std::string::npos) {
+        // If it's not HTB handle 1:, we only continue if it's the default 'noqueue' or 'pfifo_fast'
+        // on some systems, or if it's empty.
+        if (out.find("qdisc") != std::string::npos && 
+            out.find("noqueue") == std::string::npos && 
+            out.find("pfifo_fast") == std::string::npos &&
+            out.find("fq_codel") == std::string::npos) {
             err = "root qdisc already exists and is not HTB handle 1: " + out;
             return false;
         }
     }
-    return run_cmd({"tc", "qdisc", "add", "dev", iface, "root", "handle", "1:", "htb", "default", "30"}, err);
+    // Try to replace to be more robust, or add if it's noqueue
+    return run_cmd({"tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "30"}, err);
 }
 
 bool tc_setup_parent_class(const std::string &iface, std::string &err) {
-    return run_cmd({"tc", "class", "add", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", "1000mbit"}, err);
+    return run_cmd({"tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", "1000mbit"}, err);
 }
 
 bool tc_setup_leash_class(const std::string &iface, int leash_id, const std::string &rate, std::string &err) {
@@ -371,6 +392,52 @@ bool tc_setup_filter(const std::string &iface, const std::string &cgroup_id, int
 
     err = "TC filter method not initialized";
     return false;
+}
+
+bool tc_get_stats(const std::string &iface, int leash_id, TcStats &stats, std::string &err) {
+    std::string classid = "1:" + std::to_string(leash_id);
+    std::string out;
+    if (!run_cmd_capture({"tc", "-s", "class", "show", "dev", iface, "classid", classid}, out, err)) {
+        return false;
+    }
+
+    std::istringstream iss(out);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("Sent") != std::string::npos) {
+            std::istringstream lss(line);
+            std::string token;
+            while (lss >> token) {
+                if (token == "Sent") {
+                    lss >> stats.bytes;
+                    lss >> token; // "bytes"
+                    lss >> stats.packets;
+                } else if (token == "dropped" || token == "(dropped") {
+                    lss >> stats.drops;
+                } else if (token == "overlimits") {
+                    lss >> stats.overlimits;
+                }
+            }
+        } else if (line.find("rate") != std::string::npos) {
+             std::istringstream lss(line);
+             std::string token;
+             while (lss >> token) {
+                 if (token == "rate") {
+                     std::string val;
+                     lss >> val;
+                     // val could be "1234bit" or "10Kbit"
+                     // For simplicity, we'll try to extract the numeric part if possible,
+                     // but tc output is variable. Let's just store 0 if it's not a pure number.
+                     char *endptr = nullptr;
+                     stats.bps = std::strtoull(val.c_str(), &endptr, 10);
+                 } else if (token.find("pps") != std::string::npos) {
+                     char *endptr = nullptr;
+                     stats.pps = std::strtoul(token.c_str(), &endptr, 10);
+                 }
+             }
+        }
+    }
+    return true;
 }
 
 bool tc_remove_filter(const std::string &iface, const std::string &cgroup_id, std::string &err) {

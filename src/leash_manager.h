@@ -19,6 +19,7 @@ public:
 
     int list_leashes(bool json);
     int clear_leash(int pid);
+    int show_stats(int pid, bool json);
     int apply_leash(int pid, const std::string& rate, const std::string& iface_opt);
     int run_command(const std::vector<std::string>& cmd_args, const std::string& rate, const std::string& iface_opt);
 

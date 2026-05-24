@@ -29,5 +29,15 @@ bool tc_setup_parent_class(const std::string &iface, std::string &err);
 bool tc_setup_leash_class(const std::string &iface, int leash_id, const std::string &rate, std::string &err);
 bool tc_setup_filter(const std::string &iface, const std::string &cgroup_id, int leash_id, std::string &err);
 
+struct TcStats {
+    unsigned long long bytes = 0;
+    unsigned int packets = 0;
+    unsigned int drops = 0;
+    unsigned int overlimits = 0;
+    unsigned int bps = 0;
+    unsigned int pps = 0;
+};
+bool tc_get_stats(const std::string &iface, int leash_id, TcStats &stats, std::string &err);
+
 bool tc_remove_filter(const std::string &iface, const std::string &cgroup_id, std::string &err);
 bool tc_remove_class(const std::string &iface, int leash_id, std::string &err);
