@@ -13,7 +13,7 @@
 
 extern char **environ;
 
-static bool run_cmd_capture(const std::vector<std::string> &args, std::string &out, std::string &err) {
+bool run_cmd_capture(const std::vector<std::string> &args, std::string &out, std::string &err) {
     if (args.empty()) {
         err = "internal error: empty command";
         return false;

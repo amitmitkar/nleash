@@ -28,7 +28,23 @@ static int exec_helper(int argc, char **argv) {
     return 1;
 }
 
+static void print_usage() {
+    std::cerr << "Usage:\n"
+              << "  nleash --pid <PID> --rate <RATE> [--iface <IFACE>]\n"
+              << "  nleash --rate <RATE> [--iface <IFACE>] -- <cmd> [args...]\n"
+              << "  nleash --pid <PID> --clear\n"
+              << "  nleash --list [--json]\n";
+}
+
 int main(int argc, char **argv) {
+    // Handle --help without requiring privileges
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            print_usage();
+            return 0;
+        }
+    }
+
     if (geteuid() == 0) {
         return nleash_run(argc, argv, false);
     }

@@ -82,27 +82,59 @@ bool allocate_leash_id(int &out_id, std::string &err) {
 }
 
 bool append_state(const LeashState &st, std::string &err) {
-    std::ofstream out(state_file_path(), std::ios::app);
-    if (!out) {
-        err = "unable to open /run/nleash/state.txt";
+    int fd = open(state_file_path().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        err = "unable to open " + state_file_path() + ": " + std::strerror(errno);
         return false;
     }
-    out << st.pid << " " << st.uid << " " << st.starttime << " " << st.boot_id << " " << st.leash_id << " "
-        << st.iface << " " << st.rate << " " << st.cgroup_path << " " << st.classid << "\n";
-    if (!out) {
-        err = "failed to write /run/nleash/state.txt";
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        err = "unable to lock " + state_file_path() + ": " + std::strerror(errno);
         return false;
     }
+
+    std::stringstream ss;
+    ss << st.pid << " " << st.uid << " " << st.starttime << " " << st.boot_id << " " << st.leash_id << " "
+       << st.iface << " " << st.rate << " " << st.cgroup_path << " " << st.classid << "\n";
+    std::string line = ss.str();
+
+    if (write(fd, line.c_str(), line.size()) < 0) {
+        err = "failed to write to " + state_file_path() + ": " + std::strerror(errno);
+        flock(fd, LOCK_UN);
+        close(fd);
+        return false;
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
     return true;
 }
 
 bool load_state(std::vector<LeashState> &out, std::string &err) {
-    std::ifstream in(state_file_path());
-    if (!in) {
-        if (access(state_file_path().c_str(), F_OK) != 0 && errno == ENOENT) return true;
-        err = "unable to open /run/nleash/state.txt";
+    int fd = open(state_file_path().c_str(), O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) return true;
+        err = "unable to open " + state_file_path() + ": " + std::strerror(errno);
         return false;
     }
+    if (flock(fd, LOCK_SH) != 0) {
+        close(fd);
+        err = "unable to lock " + state_file_path() + ": " + std::strerror(errno);
+        return false;
+    }
+
+    // Read entire file into stringstream for parsing
+    char buf[4096];
+    std::string content;
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        content.append(buf, n);
+    }
+    
+    flock(fd, LOCK_UN);
+    close(fd);
+
+    std::istringstream in(content);
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
@@ -123,17 +155,58 @@ bool load_state(std::vector<LeashState> &out, std::string &err) {
 }
 
 bool remove_state_by_pid(int pid, int uid, std::string &err) {
-    std::vector<LeashState> all;
-    if (!load_state(all, err)) return false;
-    std::ofstream out(state_file_path(), std::ios::trunc);
-    if (!out) {
-        err = "unable to open /run/nleash/state.txt for rewrite";
+    int fd = open(state_file_path().c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        err = "unable to open " + state_file_path() + " for rewrite: " + std::strerror(errno);
         return false;
     }
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        err = "unable to lock " + state_file_path() + " for rewrite: " + std::strerror(errno);
+        return false;
+    }
+
+    char buf[4096];
+    std::string content;
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        content.append(buf, n);
+    }
+
+    std::vector<LeashState> all;
+    std::istringstream in(content);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::istringstream iss(line);
+        LeashState st;
+        if (iss >> st.pid >> st.uid >> st.starttime >> st.boot_id >> st.leash_id >> st.iface >> st.rate >> st.cgroup_path >> st.classid) {
+            all.push_back(st);
+        }
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0 || ftruncate(fd, 0) != 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        err = "failed to truncate " + state_file_path();
+        return false;
+    }
+
+    std::stringstream out;
     for (const auto &st : all) {
         if (st.pid == pid && (uid < 0 || st.uid == uid)) continue;
         out << st.pid << " " << st.uid << " " << st.starttime << " " << st.boot_id << " " << st.leash_id << " "
             << st.iface << " " << st.rate << " " << st.cgroup_path << " " << st.classid << "\n";
     }
+    std::string out_str = out.str();
+    if (write(fd, out_str.c_str(), out_str.size()) < 0) {
+        err = "failed to write rewritten state: " + std::string(std::strerror(errno));
+        flock(fd, LOCK_UN);
+        close(fd);
+        return false;
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
     return true;
 }

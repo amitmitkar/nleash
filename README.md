@@ -42,10 +42,24 @@ Each leash is tied to a strict identity tuple:
 `nleash` does **not** attempt to “fix” UDP ingress semantics.
 
 ## Requirements
+
+### Common Requirements (All Kernels)
 - Linux with **cgroup v2** mounted at `/sys/fs/cgroup`
-- Kernel support for `cls_cgroup` and `cgroup.id`
+- Kernel support for `cgroup.id`
 - Root or equivalent privileges (`CAP_NET_ADMIN` + cgroup write access). For non-root users, install the setuid helper.
 - Userspace tools: `tc`, `ip`, `modprobe`
+
+### Kernel-Specific Requirements
+
+**For kernels < 6.0 (RHEL 7/8/9, older Ubuntu):**
+- Kernel support for `cls_cgroup` (`CONFIG_NET_CLS_CGROUP=y`)
+
+**For kernels ≥ 6.0 (RHEL 10, Fedora 40+, Ubuntu 24.04+):**
+- `clang` (version 10+) for eBPF compilation
+- `bpftool` for eBPF map management
+- Kernel with eBPF cgroup helpers (kernel ≥ 4.18)
+
+> **Note**: `nleash` automatically detects which method to use. See [KERNEL_6_MIGRATION.md](KERNEL_6_MIGRATION.md) for details.
 
 If any requirement is missing, `nleash` exits with a clear error.
 

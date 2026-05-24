@@ -25,7 +25,11 @@ Cleanup only touches a live process if this tuple matches.
 - Root qdisc: `htb` with handle `1:`.
 - Parent class: `1:1` at `1000mbit` (a stable ceiling).
 - Per-leash class: `1:<leash_id>` at user rate.
-- `cls_cgroup` filter maps `cgroup.id` to the per-leash class.
+- Cgroup-to-class mapping via one of:
+  - **cls_cgroup filter** (kernels < 6.0): Traditional cgroup-based classifier
+  - **eBPF classifier** (kernels ≥ 6.0): BPF program that maps `cgroup.id` to classid
+
+The tool automatically detects and uses the appropriate method at runtime.
 
 Ingress shaping is intentionally out of scope for v1.
 
@@ -47,5 +51,20 @@ Ingress shaping is intentionally out of scope for v1.
 - For `-- command` mode, cleanup is performed after the child exits or on signal.
 
 ## Failure handling
-- If any requirement is missing (cgroup v2, cls_cgroup, tools), the tool exits with a clear error.
+- If any requirement is missing (cgroup v2, traffic control filters, tools), the tool exits with a clear error.
 - If `tc` root/class setup fails, the tool refuses to continue to avoid disrupting existing setups.
+
+## Kernel compatibility (hybrid approach)
+Starting with kernel 6.0, `CONFIG_NET_CLS_CGROUP` was removed. To maintain backwards compatibility:
+
+1. **Detection phase**: On startup, check for `cls_cgroup` availability
+2. **Fallback to eBPF**: If `cls_cgroup` is unavailable, use eBPF-based classification
+3. **Automatic compilation**: eBPF program is compiled on-demand if not already built
+4. **Transparent operation**: Users see no difference in CLI or behavior
+
+This hybrid approach ensures `nleash` works on:
+- Legacy kernels (RHEL 7/8/9) using `cls_cgroup`
+- Modern kernels (RHEL 10, Fedora 40+) using eBPF
+- Transition period kernels with either method available
+
+See [KERNEL_6_MIGRATION.md](KERNEL_6_MIGRATION.md) for technical details.
