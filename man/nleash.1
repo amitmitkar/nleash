@@ -1,12 +1,10 @@
 .TH NLEASH 1 "May 2026" "nleash" "User Commands"
 .SH NAME
-nleash \- limit outbound bandwidth for a process using cgroup v2 and eBPF
+nleash \- limit per-process network bandwidth (egress, ingress, or both) using cgroup v2 and eBPF
 .SH SYNOPSIS
 .B nleash
---pid PID --rate RATE [--burst SIZE]
-
-.B nleash
---rate RATE [--burst SIZE] -- command [args...]
+[--rate RATE] [--burst SIZE] [--ingress-rate RATE] [--ingress-burst SIZE]
+(--pid PID | -- command [args...])
 
 .B nleash
 --pid PID --clear
@@ -17,13 +15,19 @@ nleash \- limit outbound bandwidth for a process using cgroup v2 and eBPF
 .B nleash
 --stats [--pid PID] [--json]
 .SH DESCRIPTION
-nleash applies egress bandwidth limits to a process using cgroup v2 and a
-small eBPF program attached at BPF_CGROUP_INET_EGRESS. It creates a child
-cgroup under the target's existing cgroup, moves the process in, and attaches
-a token-bucket rate limiter. Packets exceeding the rate are dropped; TCP
-backs off via congestion control.
+nleash applies per-process bandwidth limits using cgroup v2 plus two small
+eBPF programs attached at BPF_CGROUP_INET_EGRESS and BPF_CGROUP_INET_INGRESS.
+It creates a child cgroup under the target's existing cgroup, moves the
+process in, and attaches per-direction token-bucket rate limiters. Packets
+that exceed the configured rate are dropped; TCP backs off via congestion
+control.
 
-Ingress shaping is intentionally out of scope.
+Either direction may be shaped independently. A rate of 0 (i.e. the option
+not specified) means that direction is unshaped. At least one of
+.BR --rate
+or
+.BR --ingress-rate
+is required.
 .PP
 For non-root usage, nleash can exec a setuid-root helper (nleash-helper)
 that performs the privileged operations. The helper enforces that non-root
@@ -31,13 +35,8 @@ callers can only act on their own processes and drops privileges before
 executing commands.
 .SH OPTIONS
 .TP
-.BR --pid " " PID
-Target an existing process ID. Only sockets opened after the leash is
-applied will be throttled (kernel limitation: socket-cgroup tags are set
-at socket() time and not updated on task migration).
-.TP
 .BR --rate " " RATE
-Egress rate. Accepts tc-style bit-per-second suffixes:
+Outbound (egress) rate cap. Accepts tc-style bit-per-second suffixes:
 .BR bit ,
 .BR kbit ,
 .BR mbit ,
@@ -46,12 +45,25 @@ Egress rate. Accepts tc-style bit-per-second suffixes:
 .BR 500kbit ,
 .BR 10mbit ).
 .TP
+.BR --ingress-rate " " RATE
+Inbound (ingress) rate cap. Same syntax as --rate. Note: ingress drops
+happen after the bytes have reached the receiver's NIC, so this controls
+what the receiver application sees but does not reduce upstream link load.
+.TP
 .BR --burst " " SIZE
-Token-bucket capacity in bytes. Accepts
+Egress token-bucket capacity in bytes. Suffixes:
 .BR b ,
 .BR kb ,
-.BR mb
-suffixes. Default is rate * 50ms with a 3KB floor.
+.BR mb .
+Default is rate * 50ms with a 3KB floor.
+.TP
+.BR --ingress-burst " " SIZE
+Ingress token-bucket capacity. Same syntax and default as --burst.
+.TP
+.BR --pid " " PID
+Target an existing process. Only sockets opened after the leash is
+applied will be throttled (kernel limitation: socket-cgroup association
+is fixed at socket() time).
 .TP
 .B --clear
 Clear the leash for the given PID. Performs identity safety checks; if the
@@ -63,15 +75,27 @@ live process.
 List current leashes (from /run/nleash/state.txt).
 .TP
 .B --stats
-Show byte counters (passed, dropped) per leash from the BPF map.
+Show byte counters per leash, broken out by direction (egress pass / egress
+drop / ingress pass / ingress drop) read from the BPF map.
 .TP
 .B --json
 Machine-readable JSON for --list / --stats.
 .SH REQUIREMENTS
-- Linux with cgroup v2 mounted at /sys/fs/cgroup
-- Kernel >= 5.15
+- Linux kernel >= 5.15 (bpf_spin_lock in cgroup_skb programs)
+- cgroup v2 mounted at /sys/fs/cgroup
 - bpffs mounted at /sys/fs/bpf (systemd default)
-- CAP_NET_ADMIN + CAP_BPF (or run via setuid helper)
+- CAP_NET_ADMIN + CAP_BPF, or run via setuid helper
+.SH NOTES
+.BR Effective\ throughput :
+nleash is a rate ceiling, not a precise pacer. Drop-based shaping plus
+TCP loss recovery typically delivers 30-80% of the configured rate on real
+links. UDP losses are silent.
+.PP
+.BR Very\ low\ rates\ on\ loopback :
+on sub-millisecond-RTT loopback, TCP can collapse before the bucket refills,
+stalling the connection entirely. The --stats drop counters confirm BPF is
+enforcing; the connection just doesn't recover. Pick a higher rate or test
+against a remote endpoint.
 .SH SAFETY
 Leashes are keyed by (pid, starttime_ticks, boot_id). If the identity does
 not match during --clear, nleash does not touch any live process and only
@@ -79,7 +103,7 @@ removes stale bpf/cgroup state.
 .SH FILES
 /run/nleash/state.txt
 /run/nleash/nextid
-/sys/fs/bpf/nleash/{prog,buckets,links/}
+/sys/fs/bpf/nleash/{prog_egress,prog_ingress,buckets}
 .SH SEE ALSO
 .BR bpf (2),
 .BR cgroups (7)
