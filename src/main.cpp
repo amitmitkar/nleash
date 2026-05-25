@@ -30,11 +30,16 @@ static int exec_helper(int argc, char **argv) {
 
 static void print_usage() {
     std::cerr << "Usage:\n"
-              << "  nleash --pid <PID> --rate <RATE> [--burst <SIZE>]\n"
-              << "  nleash --rate <RATE> [--burst <SIZE>] -- <cmd> [args...]\n"
+              << "  nleash [--rate <RATE>] [--burst <SIZE>]\n"
+              << "         [--ingress-rate <RATE>] [--ingress-burst <SIZE>]\n"
+              << "         (--pid <PID> | -- <cmd> [args...])\n"
               << "  nleash --pid <PID> --clear\n"
               << "  nleash --list [--json]\n"
               << "  nleash --stats [--pid <PID>] [--json]\n"
+              << "\n"
+              << "  --rate           Outbound (egress) rate cap.\n"
+              << "  --ingress-rate   Inbound (ingress) rate cap.\n"
+              << "  At least one of --rate / --ingress-rate must be given.\n"
               << "\n"
               << "RATE accepts bit/kbit/mbit/gbit (e.g. 500kbit, 10mbit).\n"
               << "SIZE accepts b/kb/mb (default: rate × 50ms, min 3KB).\n";

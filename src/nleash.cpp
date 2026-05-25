@@ -4,6 +4,10 @@
 #include <iostream>
 #include <unistd.h>
 
+static bool has_any_rate(const CliOptions &opt) {
+    return !opt.rate.empty() || !opt.ingress_rate.empty();
+}
+
 int nleash_run(int argc, char **argv, bool enforce_owner) {
     CliOptions opt;
     std::string err;
@@ -31,19 +35,23 @@ int nleash_run(int argc, char **argv, bool enforce_owner) {
     }
 
     if (!opt.cmd.empty()) {
-        if (opt.rate.empty()) {
-            std::cerr << "nleash: --rate is required\n";
+        if (!has_any_rate(opt)) {
+            std::cerr << "nleash: at least one of --rate / --ingress-rate is required\n";
             return 1;
         }
-        return manager.run_command(opt.cmd, opt.rate, opt.burst);
+        return manager.run_command(opt.cmd,
+                                   opt.rate, opt.burst,
+                                   opt.ingress_rate, opt.ingress_burst);
     }
 
     if (opt.pid > 0) {
-        if (opt.rate.empty()) {
-            std::cerr << "nleash: --rate is required\n";
+        if (!has_any_rate(opt)) {
+            std::cerr << "nleash: at least one of --rate / --ingress-rate is required\n";
             return 1;
         }
-        return manager.apply_leash(opt.pid, opt.rate, opt.burst);
+        return manager.apply_leash(opt.pid,
+                                   opt.rate, opt.burst,
+                                   opt.ingress_rate, opt.ingress_burst);
     }
 
     std::cerr << "nleash: no action specified\n";

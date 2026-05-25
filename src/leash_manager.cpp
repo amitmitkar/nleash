@@ -1,5 +1,5 @@
 #include "leash_manager.h"
-#include "bpf_egress.h"
+#include "bpf_filter.h"
 #include "cgroup.h"
 #include "proc.h"
 #include "state.h"
@@ -159,12 +159,18 @@ bool LeashManager::drop_to_real_user(std::string &err) {
 bool LeashManager::cleanup_leash(const LeashContext &ctx, std::string &err) {
     bool ok = true;
     std::string tmp;
-    if (ctx.cgroup_id != 0 && !bpf_egress_detach(ctx.cgroup_id, tmp)) {
-        err = "bpf detach: " + tmp;
+    // Detach BPF programs from the cgroup BEFORE removing the cgroup
+    // (you can't open a removed cgroup to detach from it).
+    if (!ctx.cgroup_path.empty() && !bpf_filter_detach_cgroup(ctx.cgroup_path, tmp)) {
+        err = "bpf detach (cgroup): " + tmp;
+        ok = false;
+    }
+    if (ctx.cgroup_id != 0 && !bpf_filter_detach(ctx.cgroup_id, tmp)) {
+        if (ok) err = "bpf detach (map): " + tmp;
         ok = false;
     }
     if (!ctx.cgroup_path.empty() && !remove_cgroup_dir(ctx.cgroup_path, tmp)) {
-        err = "rmdir cgroup: " + tmp;
+        if (ok) err = "rmdir cgroup: " + tmp;
         ok = false;
     }
     return ok;
@@ -190,8 +196,10 @@ int LeashManager::list_leashes(bool json) {
                       << "\"starttime\":" << st.starttime << ","
                       << "\"boot_id\":\"" << json_escape(st.boot_id) << "\","
                       << "\"leash_id\":" << st.leash_id << ","
-                      << "\"rate_bps\":" << st.rate_bps << ","
-                      << "\"burst_bytes\":" << st.burst_bytes << ","
+                      << "\"egress_rate_bps\":" << st.egress_rate_bps << ","
+                      << "\"egress_burst_bytes\":" << st.egress_burst_bytes << ","
+                      << "\"ingress_rate_bps\":" << st.ingress_rate_bps << ","
+                      << "\"ingress_burst_bytes\":" << st.ingress_burst_bytes << ","
                       << "\"cgroup_path\":\"" << json_escape(st.cgroup_path) << "\","
                       << "\"cgroup_id\":" << st.cgroup_id
                       << "}";
@@ -202,7 +210,8 @@ int LeashManager::list_leashes(bool json) {
             if (m_enforce_owner && m_real_uid != 0 && st.uid != static_cast<int>(m_real_uid)) continue;
             std::cout << st.pid << " " << st.uid << " " << st.starttime << " "
                       << st.boot_id << " " << st.leash_id << " "
-                      << st.rate_bps << " " << st.burst_bytes << " "
+                      << st.egress_rate_bps << " " << st.egress_burst_bytes << " "
+                      << st.ingress_rate_bps << " " << st.ingress_burst_bytes << " "
                       << st.cgroup_path << " " << st.cgroup_id << "\n";
         }
     }
@@ -283,8 +292,8 @@ int LeashManager::show_stats(int pid, bool json) {
         if (pid > 0 && st.pid != pid) continue;
         if (m_enforce_owner && m_real_uid != 0 && st.uid != static_cast<int>(m_real_uid)) continue;
 
-        uint64_t pass_bytes = 0, drop_bytes = 0;
-        if (!bpf_egress_get_stats(st.cgroup_id, pass_bytes, drop_bytes, err)) {
+        nleash_stats s;
+        if (!bpf_filter_get_stats(st.cgroup_id, s, err)) {
             continue;
         }
 
@@ -292,16 +301,21 @@ int LeashManager::show_stats(int pid, bool json) {
             if (found_any) std::cout << ",";
             std::cout << "{"
                       << "\"pid\":" << st.pid << ","
-                      << "\"rate_bps\":" << st.rate_bps << ","
-                      << "\"pass_bytes\":" << pass_bytes << ","
-                      << "\"drop_bytes\":" << drop_bytes
+                      << "\"egress_rate_bps\":" << st.egress_rate_bps << ","
+                      << "\"ingress_rate_bps\":" << st.ingress_rate_bps << ","
+                      << "\"egress_pass_bytes\":" << s.egress_pass_bytes << ","
+                      << "\"egress_drop_bytes\":" << s.egress_drop_bytes << ","
+                      << "\"ingress_pass_bytes\":" << s.ingress_pass_bytes << ","
+                      << "\"ingress_drop_bytes\":" << s.ingress_drop_bytes
                       << "}";
         } else {
             std::cout << "PID: " << st.pid
-                      << " | RATE: " << st.rate_bps << " bytes/s"
-                      << " | BURST: " << st.burst_bytes << " bytes\n"
-                      << "  Passed: " << pass_bytes << " bytes\n"
-                      << "  Dropped: " << drop_bytes << " bytes\n";
+                      << " | EGRESS RATE: " << st.egress_rate_bps << " B/s"
+                      << " | INGRESS RATE: " << st.ingress_rate_bps << " B/s\n"
+                      << "  Egress  : pass=" << s.egress_pass_bytes
+                      <<           " drop=" << s.egress_drop_bytes << " bytes\n"
+                      << "  Ingress : pass=" << s.ingress_pass_bytes
+                      <<           " drop=" << s.ingress_drop_bytes << " bytes\n";
         }
         found_any = true;
     }
@@ -330,15 +344,31 @@ static bool prepare_cgroup(const std::string &rel_cgroup,
     return true;
 }
 
-int LeashManager::apply_leash(int pid, const std::string &rate, const std::string &burst) {
-    std::string err;
-    uint64_t rate_bps = 0;
-    if (!parse_rate(rate, rate_bps, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
+// Resolve one direction's rate + burst. Empty rate string => 0 (unshaped).
+static bool resolve_dir(const std::string &rate, const std::string &burst,
+                        uint64_t &rate_bps, uint64_t &burst_bytes,
+                        std::string &err) {
+    if (rate.empty()) {
+        rate_bps = 0;
+        burst_bytes = 0;
+        return true;
     }
-    uint64_t burst_bytes = burst.empty() ? default_burst(rate_bps) : 0;
-    if (!burst.empty() && !parse_bytes(burst, burst_bytes, err)) {
+    if (!parse_rate(rate, rate_bps, err)) return false;
+    if (burst.empty()) {
+        burst_bytes = default_burst(rate_bps);
+    } else if (!parse_bytes(burst, burst_bytes, err)) {
+        return false;
+    }
+    return true;
+}
+
+int LeashManager::apply_leash(int pid,
+                              const std::string &egress_rate, const std::string &egress_burst,
+                              const std::string &ingress_rate, const std::string &ingress_burst) {
+    std::string err;
+    uint64_t eg_rate = 0, eg_burst = 0, in_rate = 0, in_burst = 0;
+    if (!resolve_dir(egress_rate, egress_burst, eg_rate, eg_burst, err) ||
+        !resolve_dir(ingress_rate, ingress_burst, in_rate, in_burst, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -359,7 +389,7 @@ int LeashManager::apply_leash(int pid, const std::string &rate, const std::strin
         return 1;
     }
 
-    if (!bpf_egress_ensure_loaded(err)) {
+    if (!bpf_filter_ensure_loaded(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -402,7 +432,8 @@ int LeashManager::apply_leash(int pid, const std::string &rate, const std::strin
         return 1;
     }
 
-    if (!bpf_egress_attach(ctx.cgroup_id, ctx.cgroup_path, rate_bps, burst_bytes, err)) {
+    if (!bpf_filter_attach(ctx.cgroup_id, ctx.cgroup_path,
+                           eg_rate, eg_burst, in_rate, in_burst, err)) {
         std::cerr << "nleash: bpf attach failed: " << err << "\n";
         remove_cgroup_dir(ctx.cgroup_path, err);
         return 1;
@@ -414,8 +445,10 @@ int LeashManager::apply_leash(int pid, const std::string &rate, const std::strin
     st.starttime = id.starttime_ticks;
     st.boot_id = id.boot_id;
     st.leash_id = leash_id;
-    st.rate_bps = rate_bps;
-    st.burst_bytes = burst_bytes;
+    st.egress_rate_bps = eg_rate;
+    st.egress_burst_bytes = eg_burst;
+    st.ingress_rate_bps = in_rate;
+    st.ingress_burst_bytes = in_burst;
     st.cgroup_path = ctx.cgroup_path;
     st.cgroup_id = ctx.cgroup_id;
 
@@ -428,15 +461,12 @@ int LeashManager::apply_leash(int pid, const std::string &rate, const std::strin
 }
 
 int LeashManager::run_command(const std::vector<std::string> &cmd_args,
-                              const std::string &rate, const std::string &burst) {
+                              const std::string &egress_rate, const std::string &egress_burst,
+                              const std::string &ingress_rate, const std::string &ingress_burst) {
     std::string err;
-    uint64_t rate_bps = 0;
-    if (!parse_rate(rate, rate_bps, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-    uint64_t burst_bytes = burst.empty() ? default_burst(rate_bps) : 0;
-    if (!burst.empty() && !parse_bytes(burst, burst_bytes, err)) {
+    uint64_t eg_rate = 0, eg_burst = 0, in_rate = 0, in_burst = 0;
+    if (!resolve_dir(egress_rate, egress_burst, eg_rate, eg_burst, err) ||
+        !resolve_dir(ingress_rate, ingress_burst, in_rate, in_burst, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -445,7 +475,7 @@ int LeashManager::run_command(const std::vector<std::string> &cmd_args,
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
-    if (!bpf_egress_ensure_loaded(err)) {
+    if (!bpf_filter_ensure_loaded(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -483,7 +513,8 @@ int LeashManager::run_command(const std::vector<std::string> &cmd_args,
     }
 
     // Attach BEFORE fork so the child's first packet is already shaped.
-    if (!bpf_egress_attach(ctx.cgroup_id, ctx.cgroup_path, rate_bps, burst_bytes, err)) {
+    if (!bpf_filter_attach(ctx.cgroup_id, ctx.cgroup_path,
+                           eg_rate, eg_burst, in_rate, in_burst, err)) {
         std::cerr << "nleash: bpf attach failed: " << err << "\n";
         remove_cgroup_dir(ctx.cgroup_path, err);
         return 1;
@@ -527,8 +558,10 @@ int LeashManager::run_command(const std::vector<std::string> &cmd_args,
         std::cerr << "nleash: " << err << "\n";
     }
     st.leash_id = leash_id;
-    st.rate_bps = rate_bps;
-    st.burst_bytes = burst_bytes;
+    st.egress_rate_bps = eg_rate;
+    st.egress_burst_bytes = eg_burst;
+    st.ingress_rate_bps = in_rate;
+    st.ingress_burst_bytes = in_burst;
     st.cgroup_path = ctx.cgroup_path;
     st.cgroup_id = ctx.cgroup_id;
 

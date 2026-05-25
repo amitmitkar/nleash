@@ -10,8 +10,10 @@ struct LeashState {
     long long starttime = 0;
     std::string boot_id;
     int leash_id = 0;
-    uint64_t rate_bps = 0;
-    uint64_t burst_bytes = 0;
+    uint64_t egress_rate_bps = 0;     // 0 == "do not shape egress"
+    uint64_t egress_burst_bytes = 0;
+    uint64_t ingress_rate_bps = 0;    // 0 == "do not shape ingress"
+    uint64_t ingress_burst_bytes = 0;
     std::string cgroup_path;
     uint64_t cgroup_id = 0;   // BPF map key
 };

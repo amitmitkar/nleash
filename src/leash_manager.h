@@ -19,9 +19,14 @@ public:
     int list_leashes(bool json);
     int clear_leash(int pid);
     int show_stats(int pid, bool json);
-    int apply_leash(int pid, const std::string &rate, const std::string &burst);
+
+    // Empty rate string => no shaping in that direction.
+    int apply_leash(int pid,
+                    const std::string &egress_rate, const std::string &egress_burst,
+                    const std::string &ingress_rate, const std::string &ingress_burst);
     int run_command(const std::vector<std::string> &cmd_args,
-                    const std::string &rate, const std::string &burst);
+                    const std::string &egress_rate, const std::string &egress_burst,
+                    const std::string &ingress_rate, const std::string &ingress_burst);
 
 private:
     bool cleanup_leash(const LeashContext &ctx, std::string &err);
@@ -33,13 +38,6 @@ private:
     bool m_enforce_owner;
 };
 
-// Parse a tc-style rate string ("500kbit", "10mbit", "1gbit", "1500bit")
-// into bytes-per-second. Returns false with `err` set on bad input.
 bool parse_rate(const std::string &s, uint64_t &bytes_per_sec, std::string &err);
-
-// Parse a byte-size string ("3000", "16kb", "1mb") into bytes. Empty input is
-// rejected.
 bool parse_bytes(const std::string &s, uint64_t &bytes, std::string &err);
-
-// Default burst when the user didn't supply --burst.
 uint64_t default_burst(uint64_t rate_bps);

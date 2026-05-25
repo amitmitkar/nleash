@@ -35,6 +35,16 @@ bool parse_cli(int argc, char **argv, CliOptions &out, std::string &err) {
             out.burst = argv[++i];
             continue;
         }
+        if (!end_of_flags && is_flag(arg, "--ingress-rate")) {
+            if (i + 1 >= argc) { err = "--ingress-rate requires a value"; return false; }
+            out.ingress_rate = argv[++i];
+            continue;
+        }
+        if (!end_of_flags && is_flag(arg, "--ingress-burst")) {
+            if (i + 1 >= argc) { err = "--ingress-burst requires a value"; return false; }
+            out.ingress_burst = argv[++i];
+            continue;
+        }
         if (!end_of_flags && is_flag(arg, "--clear")) {
             out.clear = true;
             continue;

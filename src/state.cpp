@@ -23,8 +23,9 @@ std::string nextid_file_path() {
     return state_dir() + "/nextid";
 }
 
-// File format marker. Old (HTB-era) lines are skipped on load.
-static const char *kStateMarker = "#nleash-v2\n";
+// File format marker. Lines without the current marker (older schemas) are
+// skipped on load.
+static const char *kStateMarker = "#nleash-v3\n";
 static const char kStateMarkerCh = '#';
 
 bool ensure_state_dir(std::string &err) {
@@ -89,7 +90,8 @@ static std::string serialize(const LeashState &st) {
     std::stringstream ss;
     ss << st.pid << " " << st.uid << " " << st.starttime << " "
        << st.boot_id << " " << st.leash_id << " "
-       << st.rate_bps << " " << st.burst_bytes << " "
+       << st.egress_rate_bps << " " << st.egress_burst_bytes << " "
+       << st.ingress_rate_bps << " " << st.ingress_burst_bytes << " "
        << st.cgroup_path << " " << st.cgroup_id << "\n";
     return ss.str();
 }
@@ -98,7 +100,9 @@ static bool parse_line(const std::string &line, LeashState &st) {
     if (line.empty() || line[0] == kStateMarkerCh) return false;
     std::istringstream iss(line);
     if (!(iss >> st.pid >> st.uid >> st.starttime >> st.boot_id
-              >> st.leash_id >> st.rate_bps >> st.burst_bytes
+              >> st.leash_id
+              >> st.egress_rate_bps >> st.egress_burst_bytes
+              >> st.ingress_rate_bps >> st.ingress_burst_bytes
               >> st.cgroup_path >> st.cgroup_id)) {
         return false;
     }

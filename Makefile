@@ -11,7 +11,7 @@ SRC := \
 	src/cli.cpp \
 	src/proc.cpp \
 	src/cgroup.cpp \
-	src/bpf_egress.cpp \
+	src/bpf_filter.cpp \
 	src/state.cpp
 
 BIN := bin/nleash
