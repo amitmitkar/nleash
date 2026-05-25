@@ -35,7 +35,7 @@ int nleash_run(int argc, char **argv, bool enforce_owner) {
             std::cerr << "nleash: --rate is required\n";
             return 1;
         }
-        return manager.run_command(opt.cmd, opt.rate, opt.iface);
+        return manager.run_command(opt.cmd, opt.rate, opt.burst);
     }
 
     if (opt.pid > 0) {
@@ -43,7 +43,7 @@ int nleash_run(int argc, char **argv, bool enforce_owner) {
             std::cerr << "nleash: --rate is required\n";
             return 1;
         }
-        return manager.apply_leash(opt.pid, opt.rate, opt.iface);
+        return manager.apply_leash(opt.pid, opt.rate, opt.burst);
     }
 
     std::cerr << "nleash: no action specified\n";

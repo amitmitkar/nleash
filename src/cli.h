@@ -11,7 +11,7 @@ struct CliOptions {
     bool has_pid = false;
     int pid = -1;
     std::string rate;
-    std::string iface;
+    std::string burst;   // empty => use default (rate × 50ms, min 2×MTU)
     std::vector<std::string> cmd;
 };
 

@@ -12,7 +12,7 @@ if [ ! -x "$BIN" ]; then
   exit 0
 fi
 
-# Check privileges: either root, or setuid helper available.
+# Privileges: either root, or setuid helper.
 if [ "$(id -u)" -ne 0 ]; then
   if [ ! -x "$HELPER" ]; then
     say "SKIP: $HELPER not found. Install helper or run as root."
@@ -39,21 +39,13 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
 fi
 
-# Basic tooling checks.
-for cmd in tc ip modprobe; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    say "SKIP: required tool '$cmd' not found in PATH."
-    exit 0
-  fi
-done
-
-# cgroup v2 check.
+# cgroup v2 + bpffs checks.
 if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
   say "SKIP: cgroup v2 not detected at /sys/fs/cgroup."
   exit 0
 fi
-if [ ! -f /sys/fs/cgroup/cgroup.id ]; then
-  say "SKIP: cgroup.id not available (kernel missing cgroup.id support)."
+if [ ! -d /sys/fs/bpf ]; then
+  say "SKIP: bpffs not mounted at /sys/fs/bpf."
   exit 0
 fi
 
@@ -87,19 +79,26 @@ if [ "${NLEASH_ACTIVE:-0}" = "1" ]; then
 fi
 
 if [ "${NLEASH_NETTEST:-0}" = "1" ]; then
-  say "Running network exercise with nc (best-effort)..."
-  if ! command -v nc >/dev/null 2>&1; then
-    say "SKIP: nc not found; set NLEASH_NETTEST=1 requires nc."
-  elif [ -z "${NLEASH_NC_HOST:-}" ] || [ -z "${NLEASH_NC_PORT:-}" ]; then
-    say "SKIP: set NLEASH_NC_HOST and NLEASH_NC_PORT for nc test."
+  say "Running throttled-download test (requires Internet)..."
+  if ! command -v curl >/dev/null 2>&1; then
+    say "SKIP: curl not found."
   else
-    bytes="${NLEASH_NET_BYTES:-1048576}"
-    # Send a fixed amount of data to a listener using nc.
-    if "$BIN" --rate 200kbit -- sh -c "head -c ${bytes} /dev/zero | nc -w 5 \"$NLEASH_NC_HOST\" \"$NLEASH_NC_PORT\" >/dev/null 2>&1"; then
-      say "Network exercise completed."
-    else
-      say "SKIP: network exercise failed (no listener or blocked)."
+    rate="${NLEASH_RATE:-1mbit}"
+    url="${NLEASH_URL:-https://speed.cloudflare.com/__down?bytes=2000000}"
+    cap="${NLEASH_CAP_SEC:-30}"
+
+    start=$(date +%s)
+    "$BIN" --rate "$rate" -- \
+      curl -s -L -o /dev/null --max-time "$cap" "$url" >/dev/null 2>&1 || true
+    end=$(date +%s)
+    elapsed=$((end - start))
+
+    # At 1mbit, 2MB should take ~16s. Anything under 5s means no throttling.
+    if [ "$elapsed" -lt 5 ]; then
+      say "FAIL: throttled download finished in ${elapsed}s (expected >= 5s at ${rate}). No throttling."
+      exit 1
     fi
+    say "Throttled download took ${elapsed}s at ${rate}."
   fi
 fi
 

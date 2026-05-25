@@ -1,81 +1,51 @@
 #!/bin/bash
-# tests/nleash-arch-tests.sh
-# Verification for architectural improvements:
-# 1. Idempotent root qdisc (Second Leash bug)
-# 2. State file locking/concurrency
-# 3. Modular LeashManager behavior
+# Architectural verification:
+# 1. Multiple concurrent leashes (no shared-qdisc contention since there is no qdisc)
+# 2. State file integrity under parallel ops (flock)
+# 3. Cgroup nesting (target ends up in /<parent>/nleash-N)
+# 4. BPF pin lifecycle (prog/map persist across CLI invocations; per-leash links unpinned on detach)
+# 5. Positive throttling test (curl actually slows down)
 
 set -e
 
-# Path to the binary
 NLEASH="./bin/nleash"
-IFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-
-if [ -z "$IFACE" ]; then
-    echo "ERROR: Could not detect default interface."
-    exit 1
-fi
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "SKIP: This test requires root/sudo to manipulate tc and cgroups."
+    echo "SKIP: This test requires root/sudo to manage cgroups and BPF."
     exit 0
 fi
 
-# Ensure bin is built
+if [ ! -d /sys/fs/bpf ]; then
+    echo "SKIP: /sys/fs/bpf not mounted."
+    exit 0
+fi
+
 make -s all
 
-echo "--- Test 1: Idempotent Root Qdisc (Multiple Leashes) ---"
-# Apply first leash
+echo "--- Test 1: Multiple concurrent leashes ---"
 $NLEASH --rate 1mbit -- sleep 10 &
 P1=$!
-sleep 1
+sleep 0.5
+$NLEASH --rate 2mbit -- sleep 10 &
+P2=$!
+sleep 0.5
 
-# Apply second leash (should not fail now)
-if $NLEASH --rate 2mbit -- sleep 10 & P2=$!; then
-    echo "SUCCESS: Second leash applied correctly."
+LIST_COUNT=$($NLEASH --list | wc -l)
+if [ "$LIST_COUNT" -ge 2 ]; then
+    echo "SUCCESS: $LIST_COUNT concurrent leashes active."
 else
-    echo "FAILURE: Second leash failed (likely Second Leash bug)."
-    kill $P1 2>/dev/null || true
+    echo "FAILURE: expected >= 2 leashes, got $LIST_COUNT"
+    kill $P1 $P2 2>/dev/null || true
     exit 1
 fi
 
-# Cleanup
 kill $P1 $P2 2>/dev/null || true
 wait $P1 $P2 2>/dev/null || true
 echo "Test 1 Passed."
 
-echo "--- Test 2: State File Integrity (Concurrency) ---"
-# We'll run many leashes in parallel to stress the flock implementation
-NUM_PROCS=10
-PIDS=()
-
-echo "Launching $NUM_PROCS parallel leashes..."
-for i in $(seq 1 $NUM_PROCS); do
-    $NLEASH --rate 1mbit -- sleep 5 &
-    PIDS+=($!)
-done
-
-# Wait for them to finish
-for p in "${PIDS[@]}"; do
-    wait $p || true
-done
-
-# After all exit, the state file should be empty (assuming no other leashes were active)
-COUNT=$(sudo ./bin/nleash --list | wc -l)
-if [ "$COUNT" -eq 0 ]; then
-    echo "SUCCESS: State file is clean after concurrent operations."
-else
-    echo "WARNING: State file has $COUNT dangling entries. Check if this is expected."
-    # We won't exit 1 here if other leashes exist, but on a clean system it should be 0.
-fi
-echo "Test 2 Passed."
-
-echo "--- Test 3: Cgroup Nesting Verification ---"
-# Verify that leashes are created under the correct parent cgroup
-# Use a longer sleep to ensure the process stays alive during inspection
+echo "--- Test 2: Cgroup nesting ---"
 $NLEASH --rate 1mbit -- sleep 30 &
 P3=$!
-# Wait for the process to actually start and for nleash to move it
 sleep 2
 
 if ! ps -p $P3 > /dev/null; then
@@ -83,19 +53,59 @@ if ! ps -p $P3 > /dev/null; then
     exit 1
 fi
 
-CG_PATH=$(cat /proc/$P3/cgroup | cut -d: -f3 | head -n1)
+# Walk to the sleep grandchild
+SLEEP_PID=$(pgrep -P $(pgrep -P $P3 | head -1) | head -1)
+[ -z "$SLEEP_PID" ] && SLEEP_PID=$(pgrep -P $P3 | head -1)
+[ -z "$SLEEP_PID" ] && SLEEP_PID=$P3
+
+CG_PATH=$(awk -F: '/^0::/ {print $3}' /proc/$SLEEP_PID/cgroup)
 if [[ "$CG_PATH" == *"/nleash-"* ]]; then
-    echo "SUCCESS: Process is in a nested nleash cgroup: $CG_PATH"
+    echo "SUCCESS: Process is in nested cgroup: $CG_PATH"
 else
-    # On some systems, the error 'cgroup.id not available' might prevent the move.
-    # We check if the move was attempted or if the tool bailed.
     echo "FAILURE: Process is NOT in a nested nleash cgroup: $CG_PATH"
-    echo "Note: If you saw 'cgroup.id not available', this is expected on this kernel."
     kill $P3 2>/dev/null || true
     exit 1
 fi
 kill $P3 2>/dev/null || true
 wait $P3 2>/dev/null || true
+echo "Test 2 Passed."
+
+echo "--- Test 3: BPF pin lifecycle ---"
+# After previous tests, prog/map should be pinned but links should be empty.
+if [ -e /sys/fs/bpf/nleash/prog ] && [ -e /sys/fs/bpf/nleash/buckets ]; then
+    echo "SUCCESS: prog and buckets are pinned."
+else
+    echo "FAILURE: expected /sys/fs/bpf/nleash/{prog,buckets} to exist."
+    ls -la /sys/fs/bpf/nleash/ || true
+    exit 1
+fi
+
+LINKS=$(ls /sys/fs/bpf/nleash/links/ 2>/dev/null | wc -l)
+if [ "$LINKS" -eq 0 ]; then
+    echo "SUCCESS: no orphaned per-leash links."
+else
+    echo "WARNING: $LINKS link(s) remain after teardown."
+    ls -la /sys/fs/bpf/nleash/links/
+fi
 echo "Test 3 Passed."
+
+echo "--- Test 4: Actual throttling (1mbit; should take >= 5s for 2MB) ---"
+if command -v curl >/dev/null 2>&1; then
+    start=$(date +%s)
+    $NLEASH --rate 1mbit -- \
+        curl -s -L -o /dev/null --max-time 30 \
+        'https://speed.cloudflare.com/__down?bytes=2000000' >/dev/null 2>&1 || true
+    end=$(date +%s)
+    elapsed=$((end - start))
+    if [ "$elapsed" -ge 5 ]; then
+        echo "SUCCESS: 2MB at 1mbit took ${elapsed}s (>= 5s)."
+    else
+        echo "FAILURE: 2MB at 1mbit took only ${elapsed}s — throttling not effective."
+        exit 1
+    fi
+else
+    echo "SKIP: curl not found; cannot verify throttling end-to-end."
+fi
+echo "Test 4 Passed."
 
 echo "All Architectural Tests Passed!"

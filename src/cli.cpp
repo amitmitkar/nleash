@@ -30,9 +30,9 @@ bool parse_cli(int argc, char **argv, CliOptions &out, std::string &err) {
             out.rate = argv[++i];
             continue;
         }
-        if (!end_of_flags && is_flag(arg, "--iface")) {
-            if (i + 1 >= argc) { err = "--iface requires a value"; return false; }
-            out.iface = argv[++i];
+        if (!end_of_flags && is_flag(arg, "--burst")) {
+            if (i + 1 >= argc) { err = "--burst requires a value"; return false; }
+            out.burst = argv[++i];
             continue;
         }
         if (!end_of_flags && is_flag(arg, "--clear")) {

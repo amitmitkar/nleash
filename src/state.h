@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -9,10 +10,10 @@ struct LeashState {
     long long starttime = 0;
     std::string boot_id;
     int leash_id = 0;
-    std::string iface;
-    std::string rate;
+    uint64_t rate_bps = 0;
+    uint64_t burst_bytes = 0;
     std::string cgroup_path;
-    std::string classid;
+    uint64_t cgroup_id = 0;   // BPF map key
 };
 
 bool ensure_state_dir(std::string &err);

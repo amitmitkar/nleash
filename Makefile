@@ -2,7 +2,6 @@ CXX := g++
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -pedantic
 LDFLAGS := -lbpf -lelf -lz
 
-# Check if clang is available for eBPF compilation
 CLANG := $(shell command -v clang 2>/dev/null)
 BPFTOOL := $(shell command -v bpftool 2>/dev/null)
 
@@ -12,28 +11,23 @@ SRC := \
 	src/cli.cpp \
 	src/proc.cpp \
 	src/cgroup.cpp \
-	src/tc.cpp \
-	src/state.cpp \
-	src/netutil.cpp
+	src/bpf_egress.cpp \
+	src/state.cpp
 
 BIN := bin/nleash
 HELPER := bin/nleash-helper
-BPF_OBJ := bin/tc_cgroup.bpf.o
-BPF_SKEL := src/tc_cgroup.skel.h
+BPF_OBJ := bin/leash.bpf.o
+BPF_SKEL := src/leash.skel.h
 VMLINUX_H := src/vmlinux.h
 
-# Build eBPF object if clang and bpftool are available, otherwise skip
-ifdef CLANG
-ifdef BPFTOOL
+ifndef CLANG
+$(error clang is required for eBPF compilation (install package: clang))
+endif
+ifndef BPFTOOL
+$(error bpftool is required for CO-RE BPF build (install package: bpftool))
+endif
+
 all: $(VMLINUX_H) $(BPF_SKEL) $(BIN) $(HELPER)
-else
-all: $(BIN) $(HELPER)
-	@echo "Warning: bpftool not found, skipping eBPF CO-RE build"
-endif
-else
-all: $(BIN) $(HELPER)
-	@echo "Warning: clang not found, skipping eBPF compilation"
-endif
 
 $(VMLINUX_H):
 	@mkdir -p src
@@ -50,10 +44,9 @@ $(HELPER): $(SRC) src/helper_main.cpp $(BPF_SKEL)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) -Isrc -o $(HELPER) src/helper_main.cpp $(SRC) $(LDFLAGS)
 
-# Compile eBPF program (requires clang with BPF target support)
-$(BPF_OBJ): src/tc_cgroup.bpf.c $(VMLINUX_H)
+$(BPF_OBJ): src/leash.bpf.c $(VMLINUX_H)
 	@mkdir -p bin
-	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_x86 -Isrc -I. -c src/tc_cgroup.bpf.c -o $(BPF_OBJ)
+	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_x86 -Isrc -I. -c src/leash.bpf.c -o $(BPF_OBJ)
 
 test: all
 	./tests/nleash-smoke.sh

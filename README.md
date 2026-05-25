@@ -1,116 +1,144 @@
 # nleash
 
-`nleash` is a conservative, Linux-only CLI tool that limits **egress (outbound) network bandwidth** for a specific process or for a command you launch under control. It uses **cgroup v2** for grouping and **tc (HTB + cls_cgroup)** for enforcement.
+A Linux CLI that limits **egress (outbound) network bandwidth** for a single process — either an existing PID or a command you launch under it.
+
+```sh
+nleash --rate 1mbit -- curl -X POST --data-binary @bigfile https://upload.example.com/
+nleash --pid 12345 --rate 500kbit
+nleash --pid 12345 --clear
+nleash --list
+nleash --stats --pid 12345
+```
 
 ## What it does
-- Apply an egress bandwidth limit to an existing PID.
-- Run a command under an egress limit.
-- List or clear active leashes.
+
+- Throttles outbound bytes per process (or per command tree).
+- Rate is the **ceiling** — TCP backs off via congestion control; offered throughput converges below the cap.
+- Works on any interface (WiFi, wired, virtual) — enforcement happens at the cgroup egress hook, before the driver.
+- Per-leash isolation: each leash has its own token bucket; leashes do not interfere with each other or with the rest of the system's traffic.
 
 ## What it doesn't
-- No ingress throttling.
-- No daemon or background service.
-- No Kubernetes abstractions.
-- No eBPF programs.
-- No persistence across reboot.
-- No process-tree manipulation beyond cgroup inheritance.
 
-## Why no ingress
-Ingress shaping is not reliably enforceable per-process with tc + cgroup on the receiving host. It requires IFB, ingress redirection, or external network control, and behavior is especially complex for UDP. This tool intentionally restricts scope to safe, deterministic egress control.
+- No ingress (download) shaping. See **Egress, not ingress** below.
+- No daemon or background service.
+- No persistence across reboot.
+- For `--pid`: only sockets opened *after* the leash is applied are throttled (kernel limitation, see below).
 
 ## How it works
-- Determines the target process’s **current cgroup v2 path** and creates a **child cgroup** under it.
-- Moves the target process into the child cgroup (threads move together).
-- Reads `cgroup.id` and installs a `tc` filter that maps that cgroup ID to a rate-limited class.
-This preserves all existing CPU/memory/IO limits and container/systemd placement.
 
-### Cgroup inheritance behavior
-- Writing a PID to `cgroup.procs` moves the **entire process** (all threads).
-- Child processes automatically inherit the leash when they fork/exec.
+```
+process(es)
+    │
+    ▼
+cgroup v2: /sys/fs/cgroup/<parent>/nleash-N
+    │  (BPF link attached at BPF_CGROUP_INET_EGRESS)
+    ▼
+leash.bpf.o  ── per-skb ──▶  buckets map [cgroup_id → token bucket]
+    │
+    ├── tokens >= skb->len  →  return 1  (pass)
+    └── tokens <  skb->len  →  return 0  (drop)
+```
 
-## Safety: PID reuse and reboots
-Each leash is tied to a strict identity tuple:
+For each leash:
 
-`(pid, starttime_ticks, boot_id)`
+1. `nleash` creates a child cgroup `…/nleash-<id>` under the target process's existing cgroup.
+2. The target process (or the spawned child) is moved into the new cgroup. Subprocesses inherit it.
+3. A small eBPF program (`leash.bpf.o`) is loaded once and pinned at `/sys/fs/bpf/nleash/prog`; its `buckets` map is pinned at `/sys/fs/bpf/nleash/buckets`.
+4. A `bpf_link` is created at `BPF_CGROUP_INET_EGRESS` on the leash cgroup and pinned at `/sys/fs/bpf/nleash/links/<cgroup_id>`. This survives the CLI exiting.
+5. For every egress packet from a process in the cgroup, the BPF program looks up that cgroup's token bucket, refills it from `(now - last_refill) * rate`, and either consumes `skb->len` tokens (pass) or drops the packet. Pass/drop byte counters are kept in the bucket for `--stats`.
 
-`nleash` refuses to manipulate a live process if the identity does not match, preventing PID reuse bugs and cross-reboot corruption. Cleanup still removes stale tc and cgroup state.
+Cleanup unlinks the pinned link (the kernel detaches the program from the cgroup), removes the bucket entry, and `rmdir`s the cgroup. The shared `prog` + `buckets` pins stay around (they're on tmpfs and disappear at reboot).
 
-## TCP vs UDP semantics
-- TCP: outbound shaping behaves predictably (backpressure, reduced send rate).
-- UDP: packets are dropped/queued by the shaping class, but the application may not observe backpressure, so behavior depends on the sender.
+## Egress, not ingress
 
-`nleash` does **not** attempt to “fix” UDP ingress semantics.
+`nleash` shapes packets going **out** of the host. A download (`curl -O ...`) is mostly inbound bytes; the only outbound traffic from the receiver is TCP ACKs, which are ~2% of total bandwidth. Throttling those to 1 mbit will *not* visibly slow a 50 mbit download.
+
+To exercise the leash you need a workload that actually sends bytes:
+
+```sh
+# Upload to a server
+nleash --rate 1mbit -- curl -X POST --data-binary @bigfile https://...
+
+# iperf3 client mode (uploads by default)
+nleash --rate 1mbit -- iperf3 -c remote.host
+
+# Self-contained loopback test
+ncat -l 127.0.0.1 9999 > /dev/null &
+nleash --rate 1mbit -- bash -c 'dd if=/dev/zero bs=1M count=5 | ncat --send-only 127.0.0.1 9999'
+```
+
+## TCP vs UDP
+
+- **TCP:** drops trigger congestion-control backoff. Effective throughput stays below the cap but typically lands at 30–80% of the configured rate, depending on RTT and how aggressive the sender is. `nleash` is a rate **ceiling**, not a precise pacer.
+- **UDP:** packets above the rate are dropped silently. UDP applications don't get backpressure unless they implement it themselves.
+
+## `--pid` and existing sockets
+
+When a process is migrated into a cgroup, **its already-open sockets retain their original cgroup association** — the kernel does not re-tag them. `nleash --pid` throttles only the sockets the target opens *after* the leash is applied. For long-lived programs whose connections are already established (`ssh`, persistent HTTP/2), `--pid` will mostly be a no-op. Workaround: leash the process at launch with `nleash --rate ... -- cmd`, or restart the target.
 
 ## Requirements
 
-### Common Requirements (All Kernels)
-- Linux with **cgroup v2** mounted at `/sys/fs/cgroup`
-- Kernel support for `cgroup.id`
-- Root or equivalent privileges (`CAP_NET_ADMIN` + cgroup write access). For non-root users, install the setuid helper.
-- Userspace tools: `tc`, `ip`, `modprobe`
+- Linux kernel **≥ 5.15** (`bpf_spin_lock` in `cgroup_skb` programs).
+- cgroup v2 mounted at `/sys/fs/cgroup`.
+- bpffs mounted at `/sys/fs/bpf` (systemd default).
+- Root, or the setuid helper installed (see below).
 
-### Kernel-Specific Requirements
+Build dependencies: `clang`, `bpftool`, `libbpf-devel`, `libelf-devel`.
 
-**For kernels < 6.0 (RHEL 7/8/9, older Ubuntu):**
-- Kernel support for `cls_cgroup` (`CONFIG_NET_CLS_CGROUP=y`)
+## Build and install
 
-**For kernels ≥ 6.0 (RHEL 10, Fedora 40+, Ubuntu 24.04+):**
-- `clang` (version 10+) for eBPF compilation
-- `bpftool` for eBPF map management
-- Kernel with eBPF cgroup helpers (kernel ≥ 4.18)
-
-> **Note**: `nleash` automatically detects which method to use. See [KERNEL_6_MIGRATION.md](KERNEL_6_MIGRATION.md) for details.
-
-If any requirement is missing, `nleash` exits with a clear error.
-
-## Installation
 ```sh
 make
 sudo ./bin/nleash --list
 ```
 
-## Unprivileged usage (with helper)
-To allow any user to leash their **own** processes, install the helper as setuid root:
+### Unprivileged usage (setuid helper)
+
 ```sh
 sudo chown root:root bin/nleash-helper
 sudo chmod u+s bin/nleash-helper
 ```
 
-This grants `nleash-helper` root privileges; audit and deploy carefully.
-
-`nleash` will exec `nleash-helper` automatically when run without privileges (from the same
-directory or from `PATH`). The helper enforces ownership: non-root callers can only act on
-processes they own, and commands are executed as the calling user (not root).
+Non-root callers can then leash processes they own. The helper enforces ownership and drops privileges back to the calling user before executing the spawned command.
 
 ## Usage
-```sh
-nleash --pid <PID> --rate <RATE> [--iface <IFACE>]
-nleash --rate <RATE> [--iface <IFACE>] -- <cmd> [args...]
-nleash --pid <PID> --clear
+
+```
+nleash --rate RATE [--burst SIZE] -- cmd [args...]
+nleash --pid PID --rate RATE [--burst SIZE]
+nleash --pid PID --clear
 nleash --list [--json]
+nleash --stats [--pid PID] [--json]
 ```
 
-If the helper is not installed as setuid root, run the same commands with `sudo`.
+| Option | Meaning |
+|--------|---------|
+| `--rate RATE` | Egress rate. Suffixes: `bit`, `kbit`, `mbit`, `gbit` (e.g. `500kbit`, `10mbit`). |
+| `--burst SIZE` | Token bucket capacity. Suffixes: `b`, `kb`, `mb`. Default: `rate × 50ms`, minimum 3 KB. |
+| `--pid PID` | Apply to an existing process. |
+| `-- cmd ...` | Spawn `cmd` and apply the leash to it (and its descendants). |
+| `--clear` | Remove the leash for `PID`. Validates `(pid, starttime, boot_id)` before touching the process. |
+| `--list` | Show active leashes. |
+| `--stats` | Show per-leash byte counters (passed, dropped) from the BPF map. |
+| `--json` | Machine-readable output for `--list` / `--stats`. |
 
-`RATE` is a `tc` rate string such as `500kbit`, `10mbit`, `1gbit`.
+## Safety
 
-If `--iface` is omitted, the default route interface is detected via `ip route show default`.
-
-## Comparison to trickle
-- `trickle` uses `LD_PRELOAD` and affects only dynamically linked applications that call sockets through libc.
-- `nleash` is **kernel-native**, enforcing limits at the cgroup + qdisc level and covering all traffic from the cgroup.
+Each leash records the target's `(pid, uid, starttime_ticks, boot_id)`. If the tuple no longer matches at `--clear` time (PID reuse, reboot), `nleash` removes only its own BPF/cgroup/state and does not touch any live process.
 
 ## State files
-`nleash` stores state in `/run/nleash/`:
-- `state.txt` (one leash per line)
-- `nextid` (monotonic leash id allocator)
 
-These are **not** persistent across reboots.
+- `/run/nleash/state.txt` — one leash per line, preceded by a `#nleash-v2` marker.
+- `/run/nleash/nextid` — monotonic leash id allocator.
+- `/sys/fs/bpf/nleash/{prog,buckets,links/<cgroup_id>}` — pinned BPF objects.
 
-State format (per line):
+Both directories live on tmpfs and are cleared at reboot.
+
+State line schema:
 ```
-pid uid starttime boot_id leash_id iface rate cgroup_path classid
+pid uid starttime boot_id leash_id rate_bps burst_bytes cgroup_path cgroup_id
 ```
 
 ## License
+
 LGPL-3.0-or-later

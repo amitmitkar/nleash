@@ -1,14 +1,16 @@
 #include "leash_manager.h"
+#include "bpf_egress.h"
 #include "cgroup.h"
-#include "netutil.h"
 #include "proc.h"
 #include "state.h"
-#include "tc.h"
 
+#include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cstdio>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -33,10 +35,10 @@ static std::string json_escape(const std::string &in) {
     for (char c : in) {
         switch (c) {
         case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
+        case '"':  out += "\\\""; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
         default:
             if (static_cast<unsigned char>(c) < 0x20) {
                 const char hex[] = "0123456789ABCDEF";
@@ -50,6 +52,72 @@ static std::string json_escape(const std::string &in) {
         }
     }
     return out;
+}
+
+bool parse_rate(const std::string &s, uint64_t &bytes_per_sec, std::string &err) {
+    if (s.empty()) { err = "rate is empty"; return false; }
+    // Split numeric prefix from unit suffix.
+    size_t i = 0;
+    while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i] == '.')) i++;
+    if (i == 0) { err = "rate must start with a number: " + s; return false; }
+    std::string num = s.substr(0, i);
+    std::string unit = s.substr(i);
+    std::transform(unit.begin(), unit.end(), unit.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+
+    double v = 0;
+    try { v = std::stod(num); } catch (...) {
+        err = "invalid rate number: " + num; return false;
+    }
+    if (v < 0) { err = "rate cannot be negative"; return false; }
+
+    // tc-style: every unit is bits-per-second unless suffix says otherwise.
+    double bps_bits = 0;
+    if (unit == "" || unit == "bit" || unit == "bps") bps_bits = v;
+    else if (unit == "kbit") bps_bits = v * 1000.0;
+    else if (unit == "mbit") bps_bits = v * 1000.0 * 1000.0;
+    else if (unit == "gbit") bps_bits = v * 1000.0 * 1000.0 * 1000.0;
+    else if (unit == "kibit") bps_bits = v * 1024.0;
+    else if (unit == "mibit") bps_bits = v * 1024.0 * 1024.0;
+    else { err = "unknown rate unit '" + unit + "' (use bit/kbit/mbit/gbit)"; return false; }
+
+    bytes_per_sec = static_cast<uint64_t>(bps_bits / 8.0);
+    if (bytes_per_sec == 0) { err = "rate rounds to zero bytes/sec"; return false; }
+    return true;
+}
+
+bool parse_bytes(const std::string &s, uint64_t &bytes, std::string &err) {
+    if (s.empty()) { err = "burst is empty"; return false; }
+    size_t i = 0;
+    while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i] == '.')) i++;
+    if (i == 0) { err = "burst must start with a number: " + s; return false; }
+    std::string num = s.substr(0, i);
+    std::string unit = s.substr(i);
+    std::transform(unit.begin(), unit.end(), unit.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+
+    double v = 0;
+    try { v = std::stod(num); } catch (...) {
+        err = "invalid burst number: " + num; return false;
+    }
+    if (v < 0) { err = "burst cannot be negative"; return false; }
+
+    double bytes_d = 0;
+    if (unit == "" || unit == "b") bytes_d = v;
+    else if (unit == "kb" || unit == "k") bytes_d = v * 1024.0;
+    else if (unit == "mb" || unit == "m") bytes_d = v * 1024.0 * 1024.0;
+    else { err = "unknown burst unit '" + unit + "' (use b/kb/mb)"; return false; }
+
+    bytes = static_cast<uint64_t>(bytes_d);
+    if (bytes == 0) { err = "burst rounds to zero bytes"; return false; }
+    return true;
+}
+
+uint64_t default_burst(uint64_t rate_bps) {
+    // rate * 50ms, with a floor of 2 MTU (~3KB).
+    uint64_t burst = (rate_bps * 50) / 1000;   // 50ms worth of bytes
+    uint64_t floor = 2 * 1500;
+    return std::max(burst, floor);
 }
 
 LeashManager::LeashManager(uid_t caller_uid, gid_t caller_gid, bool enforce_owner)
@@ -83,32 +151,20 @@ bool LeashManager::drop_to_real_user(std::string &err) {
             return false;
         }
     }
-    if (setgid(m_real_gid) != 0) {
-        err = "setgid failed";
-        return false;
-    }
-    if (setuid(m_real_uid) != 0) {
-        err = "setuid failed";
-        return false;
-    }
+    if (setgid(m_real_gid) != 0) { err = "setgid failed"; return false; }
+    if (setuid(m_real_uid) != 0) { err = "setuid failed"; return false; }
     return true;
 }
 
 bool LeashManager::cleanup_leash(const LeashContext &ctx, std::string &err) {
-    std::string tmp;
     bool ok = true;
-    if (!ctx.cgroup_id.empty()) {
-        if (!tc_remove_filter(ctx.iface, ctx.cgroup_id, tmp)) {
-            err = "failed to remove tc filter";
-            ok = false;
-        }
-    }
-    if (!tc_remove_class(ctx.iface, ctx.leash_id, tmp)) {
-        err = "failed to remove tc class";
+    std::string tmp;
+    if (ctx.cgroup_id != 0 && !bpf_egress_detach(ctx.cgroup_id, tmp)) {
+        err = "bpf detach: " + tmp;
         ok = false;
     }
-    if (!remove_cgroup_dir(ctx.cgroup_path, tmp)) {
-        err = "failed to remove cgroup";
+    if (!ctx.cgroup_path.empty() && !remove_cgroup_dir(ctx.cgroup_path, tmp)) {
+        err = "rmdir cgroup: " + tmp;
         ok = false;
     }
     return ok;
@@ -134,19 +190,20 @@ int LeashManager::list_leashes(bool json) {
                       << "\"starttime\":" << st.starttime << ","
                       << "\"boot_id\":\"" << json_escape(st.boot_id) << "\","
                       << "\"leash_id\":" << st.leash_id << ","
-                      << "\"iface\":\"" << json_escape(st.iface) << "\","
-                      << "\"rate\":\"" << json_escape(st.rate) << "\","
+                      << "\"rate_bps\":" << st.rate_bps << ","
+                      << "\"burst_bytes\":" << st.burst_bytes << ","
                       << "\"cgroup_path\":\"" << json_escape(st.cgroup_path) << "\","
-                      << "\"classid\":\"" << json_escape(st.classid) << "\""
+                      << "\"cgroup_id\":" << st.cgroup_id
                       << "}";
         }
         std::cout << "]\n";
     } else {
         for (const auto &st : all) {
             if (m_enforce_owner && m_real_uid != 0 && st.uid != static_cast<int>(m_real_uid)) continue;
-            std::cout << st.pid << " " << st.uid << " " << st.starttime << " " << st.boot_id << " "
-                      << st.leash_id << " " << st.iface << " " << st.rate << " "
-                      << st.cgroup_path << " " << st.classid << "\n";
+            std::cout << st.pid << " " << st.uid << " " << st.starttime << " "
+                      << st.boot_id << " " << st.leash_id << " "
+                      << st.rate_bps << " " << st.burst_bytes << " "
+                      << st.cgroup_path << " " << st.cgroup_id << "\n";
         }
     }
     return 0;
@@ -185,29 +242,15 @@ int LeashManager::clear_leash(int pid) {
     if (!proc_exists(pid)) identity_ok = false;
     long long starttime = 0;
     if (identity_ok) {
-        if (!read_proc_starttime(pid, starttime, err)) {
-            identity_ok = false;
-        } else if (starttime != target->starttime) {
-            identity_ok = false;
-        }
+        if (!read_proc_starttime(pid, starttime, err)) identity_ok = false;
+        else if (starttime != target->starttime) identity_ok = false;
     }
 
     LeashContext ctx;
     ctx.pid = pid;
     ctx.leash_id = target->leash_id;
-    ctx.iface = target->iface;
     ctx.cgroup_path = target->cgroup_path;
-    ctx.cgroup_id.clear();
-    std::string cgid;
-    if (read_cgroup_id(target->cgroup_path, cgid, err)) {
-        ctx.cgroup_id = cgid;
-    }
-
-    // Detect TC filter method for cleanup
-    TcFilterMethod filter_method = detect_tc_filter_method(err);
-    if (filter_method != TcFilterMethod::UNKNOWN) {
-        tc_init_filter_method(filter_method, ctx.iface, err);
-    }
+    ctx.cgroup_id = target->cgroup_id;
 
     if (!cleanup_leash(ctx, err)) {
         std::cerr << "nleash: cleanup failed: " << err << "\n";
@@ -220,7 +263,7 @@ int LeashManager::clear_leash(int pid) {
     }
 
     if (!identity_ok) {
-        std::cerr << "nleash: safety check failed; cleared tc/cgroup only (pid reuse or reboot)\n";
+        std::cerr << "nleash: safety check failed; cleared bpf/cgroup only (pid reuse or reboot)\n";
     }
     return 0;
 }
@@ -235,14 +278,13 @@ int LeashManager::show_stats(int pid, bool json) {
 
     bool found_any = false;
     if (json) std::cout << "[";
-    
+
     for (const auto &st : all) {
         if (pid > 0 && st.pid != pid) continue;
         if (m_enforce_owner && m_real_uid != 0 && st.uid != static_cast<int>(m_real_uid)) continue;
 
-        TcStats stats;
-        if (!tc_get_stats(st.iface, st.leash_id, stats, err)) {
-            // Stats might fail if tc class is gone but state exists
+        uint64_t pass_bytes = 0, drop_bytes = 0;
+        if (!bpf_egress_get_stats(st.cgroup_id, pass_bytes, drop_bytes, err)) {
             continue;
         }
 
@@ -250,18 +292,16 @@ int LeashManager::show_stats(int pid, bool json) {
             if (found_any) std::cout << ",";
             std::cout << "{"
                       << "\"pid\":" << st.pid << ","
-                      << "\"bytes\":" << stats.bytes << ","
-                      << "\"packets\":" << stats.packets << ","
-                      << "\"dropped\":" << stats.drops << ","
-                      << "\"overlimits\":" << stats.overlimits << ","
-                      << "\"bps\":" << stats.bps << ","
-                      << "\"pps\":" << stats.pps
+                      << "\"rate_bps\":" << st.rate_bps << ","
+                      << "\"pass_bytes\":" << pass_bytes << ","
+                      << "\"drop_bytes\":" << drop_bytes
                       << "}";
         } else {
-            std::cout << "PID: " << st.pid << " | IFACE: " << st.iface << " | RATE: " << st.rate << "\n"
-                      << "  Sent: " << stats.bytes << " bytes, " << stats.packets << " packets\n"
-                      << "  Dropped: " << stats.drops << ", Overlimits: " << stats.overlimits << "\n"
-                      << "  Current Rate: " << stats.bps << " bps, " << stats.pps << " pps\n";
+            std::cout << "PID: " << st.pid
+                      << " | RATE: " << st.rate_bps << " bytes/s"
+                      << " | BURST: " << st.burst_bytes << " bytes\n"
+                      << "  Passed: " << pass_bytes << " bytes\n"
+                      << "  Dropped: " << drop_bytes << " bytes\n";
         }
         found_any = true;
     }
@@ -272,28 +312,41 @@ int LeashManager::show_stats(int pid, bool json) {
         else std::cout << "No active leashes.\n";
         return 1;
     }
-
     return 0;
 }
 
-int LeashManager::apply_leash(int pid, const std::string& rate, const std::string& iface_opt) {
+// Shared setup for both apply_leash and run_command. Resolves rates, sets up
+// the cgroup directory, computes cgroup id, attaches BPF, persists state.
+// On success, fills ctx; caller is responsible for moving pid(s) into the
+// cgroup at the appropriate time (before vs after fork differs).
+static bool prepare_cgroup(const std::string &rel_cgroup,
+                           int leash_id,
+                           LeashContext &ctx,
+                           std::string &err) {
+    std::string parent = (rel_cgroup == "/") ? cgroup_root() : (cgroup_root() + rel_cgroup);
+    ctx.leash_id = leash_id;
+    ctx.cgroup_path = parent + "/nleash-" + std::to_string(leash_id);
+    if (!ensure_cgroup_dir(ctx.cgroup_path, err)) return false;
+    return true;
+}
+
+int LeashManager::apply_leash(int pid, const std::string &rate, const std::string &burst) {
     std::string err;
-    if (!check_tools(err)) {
+    uint64_t rate_bps = 0;
+    if (!parse_rate(rate, rate_bps, err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+    uint64_t burst_bytes = burst.empty() ? default_burst(rate_bps) : 0;
+    if (!burst.empty() && !parse_bytes(burst, burst_bytes, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
 
-    TcFilterMethod filter_method = detect_tc_filter_method(err);
-    if (filter_method == TcFilterMethod::UNKNOWN) {
+    if (!check_cgroup_v2(err) || !ensure_state_dir(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
-
-    if (!check_cgroup_v2(err) || !check_cgroup_id_support(err) || !ensure_state_dir(err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-
     if (!check_owner(pid, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
@@ -306,18 +359,7 @@ int LeashManager::apply_leash(int pid, const std::string& rate, const std::strin
         return 1;
     }
 
-    std::string iface = iface_opt;
-    if (iface.empty() && !detect_default_iface(iface, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-
-    if (!tc_setup_root(iface, err) || !tc_setup_parent_class(iface, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-
-    if (!tc_init_filter_method(filter_method, iface, err)) {
+    if (!bpf_egress_ensure_loaded(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -333,23 +375,36 @@ int LeashManager::apply_leash(int pid, const std::string& rate, const std::strin
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
-    std::string parent = (rel_cgroup == "/") ? cgroup_root() : (cgroup_root() + rel_cgroup);
-    std::string child = parent + "/nleash-" + std::to_string(leash_id);
 
-    if (!ensure_cgroup_dir(child, err)) {
+    LeashContext ctx;
+    ctx.pid = pid;
+    if (!prepare_cgroup(rel_cgroup, leash_id, ctx, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
-    if (!move_pid_to_cgroup(pid, child, err)) {
+    if (!move_pid_to_cgroup(pid, ctx.cgroup_path, err)) {
         std::cerr << "nleash: " << err << "\n";
-        remove_cgroup_dir(child, err);
+        remove_cgroup_dir(ctx.cgroup_path, err);
         return 1;
     }
 
-    std::string cgid;
-    if (!read_cgroup_id(child, cgid, err)) {
+    std::string cgid_str;
+    if (!read_cgroup_id(ctx.cgroup_path, cgid_str, err)) {
         std::cerr << "nleash: " << err << "\n";
-        remove_cgroup_dir(child, err);
+        remove_cgroup_dir(ctx.cgroup_path, err);
+        return 1;
+    }
+    try {
+        ctx.cgroup_id = std::stoull(cgid_str);
+    } catch (...) {
+        std::cerr << "nleash: failed to parse cgroup id: " << cgid_str << "\n";
+        remove_cgroup_dir(ctx.cgroup_path, err);
+        return 1;
+    }
+
+    if (!bpf_egress_attach(ctx.cgroup_id, ctx.cgroup_path, rate_bps, burst_bytes, err)) {
+        std::cerr << "nleash: bpf attach failed: " << err << "\n";
+        remove_cgroup_dir(ctx.cgroup_path, err);
         return 1;
     }
 
@@ -359,21 +414,12 @@ int LeashManager::apply_leash(int pid, const std::string& rate, const std::strin
     st.starttime = id.starttime_ticks;
     st.boot_id = id.boot_id;
     st.leash_id = leash_id;
-    st.iface = iface;
-    st.rate = rate;
-    st.cgroup_path = child;
-    st.classid = "1:" + std::to_string(leash_id);
+    st.rate_bps = rate_bps;
+    st.burst_bytes = burst_bytes;
+    st.cgroup_path = ctx.cgroup_path;
+    st.cgroup_id = ctx.cgroup_id;
 
-    LeashContext ctx;
-    ctx.pid = pid;
-    ctx.leash_id = leash_id;
-    ctx.iface = iface;
-    ctx.cgroup_path = child;
-    ctx.cgroup_id = cgid;
-
-    if (!tc_setup_leash_class(ctx.iface, ctx.leash_id, st.rate, err) ||
-        !tc_setup_filter(ctx.iface, ctx.cgroup_id, ctx.leash_id, err) ||
-        !append_state(st, err)) {
+    if (!append_state(st, err)) {
         std::cerr << "nleash: " << err << "\n";
         cleanup_leash(ctx, err);
         return 1;
@@ -381,36 +427,25 @@ int LeashManager::apply_leash(int pid, const std::string& rate, const std::strin
     return 0;
 }
 
-int LeashManager::run_command(const std::vector<std::string>& cmd_args, const std::string& rate, const std::string& iface_opt) {
+int LeashManager::run_command(const std::vector<std::string> &cmd_args,
+                              const std::string &rate, const std::string &burst) {
     std::string err;
-    if (!check_tools(err)) {
+    uint64_t rate_bps = 0;
+    if (!parse_rate(rate, rate_bps, err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+    uint64_t burst_bytes = burst.empty() ? default_burst(rate_bps) : 0;
+    if (!burst.empty() && !parse_bytes(burst, burst_bytes, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
 
-    TcFilterMethod filter_method = detect_tc_filter_method(err);
-    if (filter_method == TcFilterMethod::UNKNOWN) {
+    if (!check_cgroup_v2(err) || !ensure_state_dir(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
-
-    if (!check_cgroup_v2(err) || !check_cgroup_id_support(err) || !ensure_state_dir(err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-
-    std::string iface = iface_opt;
-    if (iface.empty() && !detect_default_iface(iface, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-
-    if (!tc_setup_root(iface, err) || !tc_setup_parent_class(iface, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        return 1;
-    }
-
-    if (!tc_init_filter_method(filter_method, iface, err)) {
+    if (!bpf_egress_ensure_loaded(err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -426,21 +461,43 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
-    std::string parent = (rel_cgroup == "/") ? cgroup_root() : (cgroup_root() + rel_cgroup);
-    std::string child = parent + "/nleash-" + std::to_string(leash_id);
-    if (!ensure_cgroup_dir(child, err)) {
+
+    LeashContext ctx;
+    if (!prepare_cgroup(rel_cgroup, leash_id, ctx, err)) {
         std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+
+    std::string cgid_str;
+    if (!read_cgroup_id(ctx.cgroup_path, cgid_str, err)) {
+        std::cerr << "nleash: " << err << "\n";
+        remove_cgroup_dir(ctx.cgroup_path, err);
+        return 1;
+    }
+    try {
+        ctx.cgroup_id = std::stoull(cgid_str);
+    } catch (...) {
+        std::cerr << "nleash: failed to parse cgroup id: " << cgid_str << "\n";
+        remove_cgroup_dir(ctx.cgroup_path, err);
+        return 1;
+    }
+
+    // Attach BEFORE fork so the child's first packet is already shaped.
+    if (!bpf_egress_attach(ctx.cgroup_id, ctx.cgroup_path, rate_bps, burst_bytes, err)) {
+        std::cerr << "nleash: bpf attach failed: " << err << "\n";
+        remove_cgroup_dir(ctx.cgroup_path, err);
         return 1;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
         std::cerr << "nleash: fork failed\n";
+        cleanup_leash(ctx, err);
         return 1;
     }
     if (pid == 0) {
         std::string move_err;
-        if (!move_pid_to_cgroup(getpid(), child, move_err)) {
+        if (!move_pid_to_cgroup(getpid(), ctx.cgroup_path, move_err)) {
             std::cerr << "nleash: " << move_err << "\n";
             _exit(127);
         }
@@ -449,7 +506,6 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
             std::cerr << "nleash: " << drop_err << "\n";
             _exit(127);
         }
-
         std::vector<char *> argv;
         for (const auto &s : cmd_args) argv.push_back(const_cast<char *>(s.c_str()));
         argv.push_back(nullptr);
@@ -462,12 +518,7 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    std::string cgid;
-    if (!read_cgroup_id(child, cgid, err)) {
-        std::cerr << "nleash: " << err << "\n";
-        remove_cgroup_dir(child, err);
-        return 1;
-    }
+    ctx.pid = pid;
 
     LeashState st;
     st.pid = pid;
@@ -476,21 +527,12 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
         std::cerr << "nleash: " << err << "\n";
     }
     st.leash_id = leash_id;
-    st.iface = iface;
-    st.rate = rate;
-    st.cgroup_path = child;
-    st.classid = "1:" + std::to_string(leash_id);
+    st.rate_bps = rate_bps;
+    st.burst_bytes = burst_bytes;
+    st.cgroup_path = ctx.cgroup_path;
+    st.cgroup_id = ctx.cgroup_id;
 
-    LeashContext ctx;
-    ctx.pid = pid;
-    ctx.leash_id = leash_id;
-    ctx.iface = iface;
-    ctx.cgroup_path = child;
-    ctx.cgroup_id = cgid;
-
-    if (!tc_setup_leash_class(ctx.iface, ctx.leash_id, st.rate, err) ||
-        !tc_setup_filter(ctx.iface, ctx.cgroup_id, ctx.leash_id, err) ||
-        !append_state(st, err)) {
+    if (!append_state(st, err)) {
         std::cerr << "nleash: " << err << "\n";
         kill(pid, SIGTERM);
         waitpid(pid, nullptr, 0);
