@@ -2,3 +2,6 @@
 src/vmlinux.h
 vmlinux.h
 src/leash.skel.h
+/stage/
+nleash-v*-linux-*.tar.gz
+SHA256SUMS

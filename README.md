@@ -95,7 +95,29 @@ When a process is migrated into a cgroup, **its already-open sockets retain thei
 
 Build dependencies: `clang`, `bpftool`, `libbpf-devel`, `libelf-devel`.
 
-## Build and install
+## Install
+
+### Prebuilt binary (recommended)
+
+Linux x86_64 and aarch64 binaries (glibc ≥ 2.35; works on Fedora 36+,
+Ubuntu 22.04+, Debian 12+, RHEL 9+) are published on the
+[Releases page](https://github.com/amitmitkar/nleash/releases).
+
+```sh
+VER=v0.1.0
+ARCH=$(uname -m)   # x86_64 or aarch64
+curl -L -O https://github.com/amitmitkar/nleash/releases/download/${VER}/nleash-${VER}-linux-${ARCH}.tar.gz
+curl -L -O https://github.com/amitmitkar/nleash/releases/download/${VER}/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+
+tar xf nleash-${VER}-linux-${ARCH}.tar.gz
+cd nleash-${VER}-linux-${ARCH}
+sudo install -m 0755 bin/nleash         /usr/local/bin/
+sudo install -m 0755 bin/nleash-helper  /usr/local/bin/   # add `u+s` for unprivileged use
+sudo install -m 0644 man/nleash.1       /usr/local/share/man/man1/
+```
+
+### Build from source
 
 ```sh
 make

@@ -1,0 +1,103 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed by softprops/action-gh-release to create the release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            linux-tools-common \
+            linux-tools-generic \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            libzstd-dev
+          # bpftool ships in linux-tools-<kernel>; the -generic alias gives us a
+          # usable bpftool without pinning to the runner's kernel version.
+          sudo ln -sf "$(ls -1 /usr/lib/linux-tools*/bpftool | head -1)" /usr/local/bin/bpftool || true
+          which bpftool && bpftool version
+
+      - name: Build (static libbpf / libelf / zlib / libzstd)
+        env:
+          # -Bstatic forces the immediately-following -l flags to use .a files.
+          # -Bdynamic restores default linking for libstdc++/libm/libgcc_s/libc
+          # which g++ auto-links after our explicit LDFLAGS.
+          LDFLAGS: "-Wl,-Bstatic -lbpf -lelf -lz -lzstd -Wl,-Bdynamic"
+        run: |
+          make clean
+          make
+          strip bin/nleash bin/nleash-helper
+          file bin/nleash
+          echo "--- ldd output ---"
+          ldd bin/nleash || true
+          echo "--- BPF stack libs should NOT appear above ---"
+
+      - name: Stage release tree
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          NAME="nleash-${VERSION}-linux-${ARCH}"
+          mkdir -p "stage/${NAME}/bin" "stage/${NAME}/man"
+          cp bin/nleash bin/nleash-helper "stage/${NAME}/bin/"
+          cp man/nleash.1                  "stage/${NAME}/man/"
+          cp README.md DESIGN.md LICENSE CHANGELOG.md "stage/${NAME}/"
+          tar -C stage -czf "${NAME}.tar.gz" "${NAME}"
+          sha256sum "${NAME}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nleash-${{ matrix.arch }}
+          path: nleash-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS
+        run: |
+          cd dist
+          sha256sum nleash-*-linux-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: true
+          files: |
+            dist/nleash-*-linux-*.tar.gz
+            dist/SHA256SUMS
