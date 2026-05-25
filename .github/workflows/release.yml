@@ -40,6 +40,26 @@ jobs:
           sudo ln -sf "$(ls -1 /usr/lib/linux-tools*/bpftool | head -1)" /usr/local/bin/bpftool || true
           which bpftool && bpftool version
 
+      - name: Fetch pre-built vmlinux.h
+        # The runner's bpftool can't reliably parse its kernel's BTF (version
+        # skew). Use a pre-generated vmlinux.h from libbpf/vmlinux.h — CO-RE
+        # relocations handle any field-layout differences at load time, so a
+        # slightly stale header works on any kernel >= 5.15.
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          case "$ARCH" in
+            x86_64)  ARCH_DIR=x86 ;;
+            aarch64) ARCH_DIR=arm64 ;;
+            *)       echo "unknown arch $ARCH" >&2; exit 1 ;;
+          esac
+          mkdir -p src
+          curl -fsSL \
+            "https://raw.githubusercontent.com/libbpf/vmlinux.h/main/include/${ARCH_DIR}/vmlinux.h" \
+            -o src/vmlinux.h
+          wc -l src/vmlinux.h
+          head -3 src/vmlinux.h
+
       - name: Build (static libbpf / libelf / zlib / libzstd)
         env:
           # -Bstatic forces the immediately-following -l flags to use .a files.
