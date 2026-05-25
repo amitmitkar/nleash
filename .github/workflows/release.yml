@@ -48,18 +48,20 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: |
-          # In libbpf/vmlinux.h the real header files live at include/x86/
-          # and include/aarch64/. (include/x86_64/ and include/arm64/ are
-          # symlinks, which raw.githubusercontent.com doesn't follow.)
+          # libbpf/vmlinux.h keeps the real header at include/<arch>/vmlinux_X.Y.h
+          # with vmlinux.h itself as a symlink. raw.githubusercontent.com
+          # returns the symlink TARGET (a short string), not the file content,
+          # so we resolve the symlink ourselves and fetch the versioned file.
           case "$ARCH" in
             x86_64)  ARCH_DIR=x86 ;;
             aarch64) ARCH_DIR=aarch64 ;;
             *)       echo "unknown arch $ARCH" >&2; exit 1 ;;
           esac
+          BASE="https://raw.githubusercontent.com/libbpf/vmlinux.h/main/include/${ARCH_DIR}"
+          TARGET=$(curl -fsSL "${BASE}/vmlinux.h" | tr -d '[:space:]')
+          echo "Symlink vmlinux.h -> ${TARGET}"
           mkdir -p src
-          URL="https://raw.githubusercontent.com/libbpf/vmlinux.h/main/include/${ARCH_DIR}/vmlinux.h"
-          echo "Fetching $URL"
-          curl -fsSL "$URL" -o src/vmlinux.h
+          curl -fsSL "${BASE}/${TARGET}" -o src/vmlinux.h
           wc -l src/vmlinux.h
           head -3 src/vmlinux.h
 
