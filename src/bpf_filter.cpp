@@ -112,9 +112,6 @@ bool bpf_filter_ensure_loaded(std::string &err) {
         leash_bpf__destroy(skel);
         return false;
     }
-    bpf_program__set_log_level(skel->progs.leash_egress,  1);
-    bpf_program__set_log_level(skel->progs.leash_ingress, 1);
-
     if (leash_bpf__load(skel) != 0) {
         err = std::string("leash_bpf__load: ") + std::strerror(errno);
         leash_bpf__destroy(skel);
