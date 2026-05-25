@@ -114,15 +114,6 @@ bool LeashManager::cleanup_leash(const LeashContext &ctx, std::string &err) {
     return ok;
 }
 
-bool LeashManager::apply_tc_and_state(const LeashContext &ctx, const LeashState &st, std::string &err) {
-    if (!tc_setup_root(ctx.iface, err)) return false;
-    if (!tc_setup_parent_class(ctx.iface, err)) return false;
-    if (!tc_setup_leash_class(ctx.iface, ctx.leash_id, st.rate, err)) return false;
-    if (!tc_setup_filter(ctx.iface, ctx.cgroup_id, ctx.leash_id, err)) return false;
-    if (!append_state(st, err)) return false;
-    return true;
-}
-
 int LeashManager::list_leashes(bool json) {
     std::vector<LeashState> all;
     std::string err;
@@ -321,6 +312,11 @@ int LeashManager::apply_leash(int pid, const std::string& rate, const std::strin
         return 1;
     }
 
+    if (!tc_setup_root(iface, err) || !tc_setup_parent_class(iface, err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+
     if (!tc_init_filter_method(filter_method, iface, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
@@ -375,7 +371,9 @@ int LeashManager::apply_leash(int pid, const std::string& rate, const std::strin
     ctx.cgroup_path = child;
     ctx.cgroup_id = cgid;
 
-    if (!apply_tc_and_state(ctx, st, err)) {
+    if (!tc_setup_leash_class(ctx.iface, ctx.leash_id, st.rate, err) ||
+        !tc_setup_filter(ctx.iface, ctx.cgroup_id, ctx.leash_id, err) ||
+        !append_state(st, err)) {
         std::cerr << "nleash: " << err << "\n";
         cleanup_leash(ctx, err);
         return 1;
@@ -403,6 +401,11 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
 
     std::string iface = iface_opt;
     if (iface.empty() && !detect_default_iface(iface, err)) {
+        std::cerr << "nleash: " << err << "\n";
+        return 1;
+    }
+
+    if (!tc_setup_root(iface, err) || !tc_setup_parent_class(iface, err)) {
         std::cerr << "nleash: " << err << "\n";
         return 1;
     }
@@ -485,7 +488,9 @@ int LeashManager::run_command(const std::vector<std::string>& cmd_args, const st
     ctx.cgroup_path = child;
     ctx.cgroup_id = cgid;
 
-    if (!apply_tc_and_state(ctx, st, err)) {
+    if (!tc_setup_leash_class(ctx.iface, ctx.leash_id, st.rate, err) ||
+        !tc_setup_filter(ctx.iface, ctx.cgroup_id, ctx.leash_id, err) ||
+        !append_state(st, err)) {
         std::cerr << "nleash: " << err << "\n";
         kill(pid, SIGTERM);
         waitpid(pid, nullptr, 0);

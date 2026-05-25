@@ -1,57 +1,46 @@
 /*
- * eBPF classifier for cgroup-based traffic control
- * This replaces cls_cgroup for kernels >= 6.0 where CONFIG_NET_CLS_CGROUP was removed.
- *
- * The program classifies packets based on their originating cgroup and maps them
- * to the appropriate HTB class ID for rate limiting.
+ * eBPF classifier for cgroup-based traffic control using skb->mark.
  */
 
-#include <linux/bpf.h>
-#include <linux/pkt_cls.h>
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
 
-/* BPF helper function declarations */
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
-static __u64 (*bpf_skb_cgroup_id)(void *skb) = (void *) 79;
+#ifndef TC_ACT_OK
+#define TC_ACT_OK 0
+#endif
 
-/* Map type and attribute macros */
-#define SEC(NAME) __attribute__((section(NAME), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-
-/* Map: cgroup_id -> classid
- * Key: cgroup ID (u64)
- * Value: HTB class ID (u32)
- * Will be automatically pinned by tc when loaded
- */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, __u64);
-    __type(value, __u32);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } cgroup_classid_map SEC(".maps");
 
 SEC("classifier")
 int tc_cgroup_classifier(struct __sk_buff *skb)
 {
-    __u64 cgroup_id;
+    __u64 cgroup_id_64;
+    __u32 cgroup_id_32;
     __u32 *classid;
 
-    /* Get the cgroup ID of the packet's originating socket */
-    cgroup_id = bpf_skb_cgroup_id(skb);
-    if (cgroup_id == 0) {
-        /* No cgroup info available, allow default handling */
-        return TC_ACT_OK;
+    /* Get current process cgroup ID */
+    cgroup_id_64 = bpf_get_current_cgroup_id();
+    if (cgroup_id_64 == 0) {
+        cgroup_id_64 = bpf_skb_cgroup_id(skb);
     }
 
-    /* Lookup the classid for this cgroup */
-    classid = bpf_map_lookup_elem(&cgroup_classid_map, &cgroup_id);
-    if (!classid) {
-        /* No mapping found, allow default handling */
-        return TC_ACT_OK;
+    if (cgroup_id_64 != 0) {
+        cgroup_id_32 = (__u32)(cgroup_id_64 & 0xFFFFFFFF);
+        classid = bpf_map_lookup_elem(&cgroup_classid_map, &cgroup_id_32);
+        if (classid) {
+            /* Set both mark and priority for maximum compatibility */
+            skb->mark = *classid;
+            skb->priority = *classid;
+            return -1;
+        }
     }
-
-    /* Set the classid for HTB qdisc to use */
-    skb->priority = *classid;
 
     return TC_ACT_OK;
 }

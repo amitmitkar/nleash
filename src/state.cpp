@@ -51,12 +51,12 @@ bool allocate_leash_id(int &out_id, std::string &err) {
         buf[n] = 0;
         content = buf;
     }
-    int current = 1;
+    int current = 10;
     if (!content.empty()) {
         try {
             current = std::stoi(content);
         } catch (...) {
-            current = 1;
+            current = 10;
         }
     }
     out_id = current;

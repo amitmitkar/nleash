@@ -1,11 +1,17 @@
 #include "tc.h"
+#include "tc_cgroup.skel.h"
 
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include <net/if.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/utsname.h>
 #include <linux/limits.h>
+#include <linux/if_link.h>
+#include <linux/pkt_cls.h>
 
 #include <cerrno>
 #include <cstring>
@@ -19,6 +25,7 @@ extern char **environ;
 
 // Global state for which TC filter method is in use
 static TcFilterMethod g_filter_method = TcFilterMethod::UNKNOWN;
+static struct tc_cgroup_bpf *g_skel = nullptr;
 
 static bool run_cmd_lit(std::initializer_list<const char *> args, std::string &err) {
     if (args.size() == 0) {
@@ -118,7 +125,6 @@ bool ensure_cls_cgroup(std::string &err) {
     run_cmd_lit({"modprobe", "cls_cgroup"}, dummy); // best effort
     struct stat st;
     if (stat("/sys/module/cls_cgroup", &st) != 0) {
-        // Module might be built-in. Check kernel config if available.
         struct utsname uts;
         if (uname(&uts) == 0) {
             std::string cfg = std::string("/boot/config-") + uts.release;
@@ -141,21 +147,18 @@ bool ensure_cls_cgroup(std::string &err) {
 }
 
 static bool check_bpf_support(std::string &err) {
-    // Check if clang/llvm is available for BPF compilation
     std::string dummy;
     if (!run_cmd_lit({"clang", "--version"}, dummy)) {
         err = "clang not available (needed for eBPF support)";
         return false;
     }
 
-    // Check kernel version - BPF for tc available since 4.1, but bpf_skb_cgroup_id since 4.18
     struct utsname uts;
     if (uname(&uts) != 0) {
         err = "failed to get kernel version";
         return false;
     }
 
-    // Parse kernel version (simple check for >= 4.18)
     int major = 0, minor = 0;
     if (sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
         err = "failed to parse kernel version";
@@ -171,13 +174,11 @@ static bool check_bpf_support(std::string &err) {
 }
 
 TcFilterMethod detect_tc_filter_method(std::string &err) {
-    // Check kernel version
     struct utsname uts;
     if (uname(&uts) == 0) {
         int major = 0, minor = 0;
         if (sscanf(uts.release, "%d.%d", &major, &minor) == 2) {
             if (major >= 6) {
-                // On kernel 6.0+, prefer eBPF
                 std::string bpf_err;
                 if (check_bpf_support(bpf_err)) {
                     return TcFilterMethod::BPF;
@@ -186,19 +187,16 @@ TcFilterMethod detect_tc_filter_method(std::string &err) {
         }
     }
 
-    // Try cls_cgroup (for backwards compatibility with older kernels)
     std::string cls_err;
     if (ensure_cls_cgroup(cls_err)) {
         return TcFilterMethod::CLS_CGROUP;
     }
 
-    // cls_cgroup not available, try eBPF as last resort
     std::string bpf_err;
     if (check_bpf_support(bpf_err)) {
         return TcFilterMethod::BPF;
     }
 
-    // Neither method available
     err = "No suitable TC filter method available.\n";
     err += "  cls_cgroup: " + cls_err + "\n";
     err += "  eBPF: " + bpf_err;
@@ -206,104 +204,43 @@ TcFilterMethod detect_tc_filter_method(std::string &err) {
 }
 
 static std::string get_bpf_obj_path() {
-    // Get the directory where the binary is located
     char exe_path[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (len == -1) {
         return "/usr/lib/nleash/tc_cgroup.bpf.o";
     }
     exe_path[len] = '\0';
-
-    // Find the last slash
     char *last_slash = strrchr(exe_path, '/');
     if (!last_slash) {
         return "/usr/lib/nleash/tc_cgroup.bpf.o";
     }
-
     *last_slash = '\0';
     return std::string(exe_path) + "/tc_cgroup.bpf.o";
-}
-
-static bool compile_bpf_program(std::string &err) {
-    // Find source file relative to binary location
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len == -1) {
-        err = "failed to locate executable path";
-        return false;
-    }
-    exe_path[len] = '\0';
-
-    char *last_slash = strrchr(exe_path, '/');
-    if (!last_slash) {
-        err = "failed to parse executable path";
-        return false;
-    }
-    *last_slash = '\0';
-
-    std::string src_path = std::string(exe_path) + "/../src/tc_cgroup.bpf.c";
-    std::string obj_path = std::string(exe_path) + "/tc_cgroup.bpf.o";
-
-    // Check if source exists
-    struct stat st;
-    if (stat(src_path.c_str(), &st) != 0) {
-        // Try installed location
-        src_path = "/usr/share/nleash/tc_cgroup.bpf.c";
-        if (stat(src_path.c_str(), &st) != 0) {
-            err = "BPF source file not found at " + src_path;
-            return false;
-        }
-        obj_path = "/usr/lib/nleash/tc_cgroup.bpf.o";
-    }
-
-    // Check if already compiled and up-to-date
-    struct stat obj_st;
-    if (stat(obj_path.c_str(), &obj_st) == 0) {
-        if (obj_st.st_mtime >= st.st_mtime) {
-            return true;  // Already compiled and fresh
-        }
-    }
-
-    // Compile BPF program
-    std::vector<std::string> compile_cmd = {
-        "clang",
-        "-O2",
-        "-g",
-        "-target", "bpf",
-        "-c", src_path,
-        "-o", obj_path
-    };
-
-    if (!run_cmd(compile_cmd, err)) {
-        err = "failed to compile eBPF program: " + err;
-        return false;
-    }
-
-    return true;
 }
 
 bool tc_init_filter_method(TcFilterMethod method, const std::string &iface, std::string &err) {
     g_filter_method = method;
 
     if (method == TcFilterMethod::CLS_CGROUP) {
-        // cls_cgroup is already loaded, nothing more to do
         return true;
     }
 
     if (method == TcFilterMethod::BPF) {
-        // Compile BPF program if needed
-        if (!compile_bpf_program(err)) {
+        if (g_skel) return true;
+
+        g_skel = tc_cgroup_bpf__open_and_load();
+        if (!g_skel) {
+            err = "failed to open and load BPF skeleton";
             return false;
         }
 
-        // Load BPF program using tc
         std::string obj_path = get_bpf_obj_path();
         std::vector<std::string> load_cmd = {
-            "tc", "filter", "add",
+            "tc", "filter", "replace",
             "dev", iface,
             "parent", "1:",
             "protocol", "all",
-            "prio", "10",
+            "prio", "1",
             "bpf",
             "object-file", obj_path,
             "section", "classifier",
@@ -311,7 +248,9 @@ bool tc_init_filter_method(TcFilterMethod method, const std::string &iface, std:
         };
 
         if (!run_cmd(load_cmd, err)) {
-            err = "failed to load eBPF classifier: " + err;
+            err = "failed to load eBPF classifier via tc: " + err;
+            tc_cgroup_bpf__destroy(g_skel);
+            g_skel = nullptr;
             return false;
         }
 
@@ -324,22 +263,24 @@ bool tc_init_filter_method(TcFilterMethod method, const std::string &iface, std:
 
 void tc_cleanup_filter_method(TcFilterMethod method, const std::string &iface) {
     if (method == TcFilterMethod::BPF) {
-        // Remove BPF filter
         std::string dummy;
-        run_cmd({"tc", "filter", "del", "dev", iface, "parent", "1:", "prio", "10"}, dummy);
+        run_cmd({"tc", "filter", "del", "dev", iface, "parent", "1:", "prio", "1"}, dummy);
+        if (g_skel) {
+            tc_cgroup_bpf__destroy(g_skel);
+            g_skel = nullptr;
+        }
     }
     g_filter_method = TcFilterMethod::UNKNOWN;
 }
 
 bool tc_setup_root(const std::string &iface, std::string &err) {
-    // Check if a root qdisc already exists
     std::string out;
     if (run_cmd_capture({"tc", "qdisc", "show", "dev", iface, "root"}, out, err)) {
         if (out.find("htb") != std::string::npos && (out.find("handle 1:") != std::string::npos || out.find("1:") != std::string::npos)) {
-            return true; // Already setup correctly
+            std::string dummy;
+            run_cmd({"tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:30", "htb", "rate", "1000mbit"}, dummy);
+            return true; 
         }
-        // If it's not HTB handle 1:, we only continue if it's the default 'noqueue' or 'pfifo_fast'
-        // on some systems, or if it's empty.
         if (out.find("qdisc") != std::string::npos && 
             out.find("noqueue") == std::string::npos && 
             out.find("pfifo_fast") == std::string::npos &&
@@ -348,8 +289,13 @@ bool tc_setup_root(const std::string &iface, std::string &err) {
             return false;
         }
     }
-    // Try to replace to be more robust, or add if it's noqueue
-    return run_cmd({"tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "30"}, err);
+    if (!run_cmd({"tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "1e"}, err)) {
+        return false;
+    }
+    // Setup default class (1:30)
+    std::string dummy;
+    run_cmd({"tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:1e", "htb", "rate", "1000mbit"}, dummy);
+    return true;
 }
 
 bool tc_setup_parent_class(const std::string &iface, std::string &err) {
@@ -362,28 +308,33 @@ bool tc_setup_leash_class(const std::string &iface, int leash_id, const std::str
 }
 
 bool tc_setup_filter(const std::string &iface, const std::string &cgroup_id, int leash_id, std::string &err) {
+    std::string classid = "1:" + std::to_string(leash_id);
+
+    // 1. Try the modern 'cgroup' meta-classifier first (most compatible for cgroup v2)
+    // This requires the cgroup to be mapped to a classid, which nleash does via state.
+    // However, the 'tc filter ... cgroup' command handles the lookup.
+    if (run_cmd({"tc", "filter", "replace", "dev", iface, "parent", "1:", "protocol", "all", "prio", "1", "cgroup", "action", "skbedit", "priority", classid}, err)) {
+        return true;
+    }
+
     if (g_filter_method == TcFilterMethod::CLS_CGROUP) {
-        // Use traditional cls_cgroup filter
         std::string classid = "1:" + std::to_string(leash_id);
-        return run_cmd({"tc", "filter", "replace", "dev", iface, "parent", "1:", "protocol", "all", "prio", "10", "handle", cgroup_id, "cgroup", "flowid", classid}, err);
+        return run_cmd({"tc", "filter", "replace", "dev", iface, "parent", "1:", "protocol", "all", "prio", "1", "handle", cgroup_id, "cgroup", "flowid", classid}, err);
     }
 
     if (g_filter_method == TcFilterMethod::BPF) {
-        // For BPF method, we need to update the BPF map
-        // The map associates cgroup_id -> classid
-        // We'll use bpftool to update the map
-        std::string classid_hex = std::to_string(0x10000 | leash_id);  // HTB classid format
-        std::vector<std::string> update_cmd = {
-            "bpftool", "map", "update",
-            "pinned", "/sys/fs/bpf/tc/globals/cgroup_classid_map",
-            "key", cgroup_id,
-            "value", classid_hex
-        };
+        if (!g_skel) {
+            err = "BPF skeleton not initialized";
+            return false;
+        }
+        // Use only the lower 32 bits for the map key
+        unsigned long long full_cgid = std::stoull(cgroup_id);
+        unsigned int cgid_32 = (unsigned int)(full_cgid & 0xFFFFFFFF);
+        unsigned int classid = 0x10000 | (unsigned int)leash_id;
 
-        if (!run_cmd(update_cmd, err)) {
-            // bpftool might not be available, try alternative approach
-            // For now, return error indicating we need bpftool
-            err = "failed to update BPF map (bpftool required): " + err;
+        int map_fd = bpf_map__fd(g_skel->maps.cgroup_classid_map);
+        if (bpf_map_update_elem(map_fd, &cgid_32, &classid, BPF_ANY) != 0) {
+            err = "failed to update BPF map: " + std::string(strerror(errno));
             return false;
         }
 
@@ -410,7 +361,7 @@ bool tc_get_stats(const std::string &iface, int leash_id, TcStats &stats, std::s
             while (lss >> token) {
                 if (token == "Sent") {
                     lss >> stats.bytes;
-                    lss >> token; // "bytes"
+                    lss >> token; 
                     lss >> stats.packets;
                 } else if (token == "dropped" || token == "(dropped") {
                     lss >> stats.drops;
@@ -425,9 +376,6 @@ bool tc_get_stats(const std::string &iface, int leash_id, TcStats &stats, std::s
                  if (token == "rate") {
                      std::string val;
                      lss >> val;
-                     // val could be "1234bit" or "10Kbit"
-                     // For simplicity, we'll try to extract the numeric part if possible,
-                     // but tc output is variable. Let's just store 0 if it's not a pure number.
                      char *endptr = nullptr;
                      stats.bps = std::strtoull(val.c_str(), &endptr, 10);
                  } else if (token.find("pps") != std::string::npos) {
@@ -442,21 +390,15 @@ bool tc_get_stats(const std::string &iface, int leash_id, TcStats &stats, std::s
 
 bool tc_remove_filter(const std::string &iface, const std::string &cgroup_id, std::string &err) {
     if (g_filter_method == TcFilterMethod::CLS_CGROUP) {
-        // Use traditional cls_cgroup filter removal
-        return run_cmd({"tc", "filter", "del", "dev", iface, "parent", "1:", "protocol", "all", "prio", "10", "handle", cgroup_id, "cgroup"}, err);
+        return run_cmd({"tc", "filter", "del", "dev", iface, "parent", "1:", "protocol", "all", "prio", "1", "handle", cgroup_id, "cgroup"}, err);
     }
 
     if (g_filter_method == TcFilterMethod::BPF) {
-        // For BPF method, remove the entry from the map
-        std::vector<std::string> delete_cmd = {
-            "bpftool", "map", "delete",
-            "pinned", "/sys/fs/bpf/tc/globals/cgroup_classid_map",
-            "key", cgroup_id
-        };
-
-        // Ignore errors on delete (entry might not exist)
-        std::string dummy;
-        run_cmd(delete_cmd, dummy);
+        if (!g_skel) return true;
+        unsigned long long full_cgid = std::stoull(cgroup_id);
+        unsigned int cgid_32 = (unsigned int)(full_cgid & 0xFFFFFFFF);
+        int map_fd = bpf_map__fd(g_skel->maps.cgroup_classid_map);
+        bpf_map_delete_elem(map_fd, &cgid_32);
         return true;
     }
 
