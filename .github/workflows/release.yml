@@ -70,7 +70,9 @@ jobs:
           # which g++ auto-links after our explicit LDFLAGS.
           LDFLAGS: "-Wl,-Bstatic -lbpf -lelf -lz -lzstd -Wl,-Bdynamic"
         run: |
-          make clean
+          # No `make clean` here — it would delete the vmlinux.h we just
+          # downloaded, and the runner's bpftool can't regenerate it.
+          # Fresh checkout means nothing to clean anyway.
           make
           strip bin/nleash bin/nleash-helper
           file bin/nleash
